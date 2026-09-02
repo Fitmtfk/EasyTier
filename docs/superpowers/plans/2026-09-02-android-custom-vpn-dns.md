@@ -42,6 +42,19 @@ Expected: `releases/mine`
 Run（仓库根）: `corepack pnpm install`
 Expected: 以 `Done in ...` 结束，出现 `node_modules/`；若报 pnpm 下载失败，重试一次（网络问题）。
 
+- [ ] **Step 3:（环境前置，已在本机完成，重建环境时需执行）构建两个 workspace 依赖包并还原噪音文件**
+
+vitest 解析 `easytier-frontend-lib` 与 `tauri-plugin-vpnservice-api` 的入口需要它们的构建产物：
+
+```powershell
+corepack enable pnpm            # 子构建脚本内部会调 pnpm，需要 PATH shim
+pnpm --dir easytier-web/frontend-lib build
+pnpm --dir tauri-plugin-vpnservice build
+git checkout -- pnpm-lock.yaml easytier-gui/src/auto-imports.d.ts easytier-gui/src/typed-router.d.ts  # 工具链噪音不入库
+```
+
+基线验证：`pnpm --dir easytier-gui test:mobile-vpn` → `Tests 6 passed`。
+
 ---
 
 ### Task 2: DNS 优先级（测试先行：config.ts + mobile_vpn.ts + 测试）
@@ -141,7 +154,7 @@ describe('mobile VPN dns selection', () => {
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `corepack pnpm --dir easytier-gui test:mobile-vpn`
-Expected: `Tests 2 failed | 9 passed`——前两个新用例失败（实际 `dns: undefined` ≠ `'10.7.7.7'`）；后两个新用例和 7 个既有用例通过（fallback 行为本来就等于 stock 行为，属预期）。若失败数不是 2，停下排查。
+Expected: `Tests 2 failed | 8 passed`——前两个新用例失败（实际 `dns: undefined` ≠ `'10.7.7.7'`）；后两个新用例和 6 个既有用例通过（fallback 行为本来就等于 stock 行为，属预期）。若失败数不是 2，停下排查。
 
 - [ ] **Step 3: 实现 config.ts 助手**
 
@@ -213,7 +226,7 @@ import { isValidIpv4, loadCustomVpnDns } from './config'
 - [ ] **Step 5: 运行测试确认全部通过**
 
 Run: `corepack pnpm --dir easytier-gui test:mobile-vpn`
-Expected: `Test Files 1 passed`、`Tests 11 passed`。
+Expected: `Test Files 1 passed`、`Tests 10 passed`。
 
 - [ ] **Step 6: Commit**
 
@@ -331,7 +344,7 @@ Expected: 退出码 0、无输出。若有可自动修复项：`... eslint --fix
 - [ ] **Step 2: 全量单测复跑**
 
 Run: `corepack pnpm --dir easytier-gui test:mobile-vpn`
-Expected: `Tests 11 passed`。
+Expected: `Tests 10 passed`。
 
 - [ ] **Step 3: 核查改动面未越界**
 
@@ -382,7 +395,7 @@ Expected: `..\easytier-patches\` 下生成 `0001-*.patch` … 每个提交一个
 git fetch upstream
 git rebase upstream/main
 ```
-Expected: `Successfully rebased` 或 `当前分支已是最新`；若冲突，冲突面应仅在 `easytier-gui` 4 文件内——手工合并后 `git rebase --continue`。完成后 `corepack pnpm --dir easytier-gui test:mobile-vpn` 须仍 `11 passed`。
+Expected: `Successfully rebased` 或 `当前分支已是最新`；若冲突，冲突面应仅在 `easytier-gui` 4 文件内——手工合并后 `git rebase --continue`。完成后 `corepack pnpm --dir easytier-gui test:mobile-vpn` 须仍 `10 passed`。
 
 - [ ] **Step 6: 推送 fork 触发 CI（需 GitHub 凭证，失败则报告用户手工推送）**
 
