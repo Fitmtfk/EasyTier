@@ -22,9 +22,12 @@ import { GUIRemoteClient } from '~/modules/api'
 import { useToast, useConfirm } from 'primevue'
 import { loadMode, saveMode, WebClientConfig, type Mode } from '~/composables/mode'
 import {
-  saveLastNetworkInstanceId,
+  isValidIpv4,
+  loadCustomVpnDns,
   loadLastNetworkInstanceId,
   loadVpnTileStoppedInstanceIds,
+  saveCustomVpnDns,
+  saveLastNetworkInstanceId,
   saveVpnTileStoppedInstanceIds,
 } from '~/composables/config'
 import ModeSwitcher from '~/components/ModeSwitcher.vue'
@@ -41,6 +44,9 @@ const manualDisconnect = ref(false)
 
 const configServerDialogVisible = ref(false)
 const configServerConnected = ref(false)
+
+const customVpnDnsDialogVisible = ref(false)
+const editingCustomVpnDns = ref('')
 
 const showAutostartHint = ref(false)
 
@@ -433,6 +439,12 @@ const setting_menu_items: Ref<MenuItem[]> = ref([
     visible: () => ["normal", "service"].includes(currentMode.value.mode),
   },
   {
+    label: () => '自定义 VPN DNS',
+    icon: 'pi pi-cog',
+    command: openCustomVpnDnsDialog,
+    visible: () => type() === 'android',
+  },
+  {
     key: 'logging_menu',
     label: () => t('logging'),
     icon: 'pi pi-file',
@@ -462,6 +474,29 @@ async function connectRpcClient(isNormalMode: boolean, url?: string) {
 async function openConfigServerDialog() {
   editingMode.value = JSON.parse(JSON.stringify(loadMode()))
   configServerDialogVisible.value = true
+}
+
+function openCustomVpnDnsDialog() {
+  editingCustomVpnDns.value = loadCustomVpnDns() ?? ''
+  customVpnDnsDialogVisible.value = true
+}
+
+async function onCustomVpnDnsSave() {
+  const value = editingCustomVpnDns.value.trim()
+  if (value.length && !isValidIpv4(value)) {
+    toast.add({ severity: 'error', summary: t('error'), detail: '请输入合法的 IPv4 地址，或留空恢复默认', life: 5000 })
+    return
+  }
+  saveCustomVpnDns(value.length ? value : null)
+  customVpnDnsDialogVisible.value = false
+  try {
+    await syncMobileVpnService()
+    toast.add({ severity: 'success', summary: t('web.common.success'), detail: '已保存，将在 VPN 重启后生效', life: 3000 })
+  }
+  catch (e: any) {
+    toast.add({ severity: 'error', summary: t('error'), detail: e, life: 10000 })
+    console.error('Error syncing vpn service after dns change', e)
+  }
 }
 async function onConfigServerSave() {
   if (JSON.stringify(currentMode.value) === JSON.stringify(editingMode.value)) {
@@ -545,6 +580,18 @@ const configServerConnectionStatus = computed(() => {
         <Button :label="t('web.common.cancel')" icon="pi pi-times" @click="configServerDialogVisible = false" text />
         <Button :label="t('web.common.save')" icon="pi pi-save" @click="onConfigServerSave" autofocus
           :loading="isModeSaving" />
+      </template>
+    </Dialog>
+
+    <Dialog v-model:visible="customVpnDnsDialogVisible" modal header="自定义 VPN DNS" :style="{ width: '50vw' }">
+      <div class="flex flex-col gap-3">
+        <label for="custom-vpn-dns">DNS 服务器 IPv4 地址</label>
+        <InputText id="custom-vpn-dns" v-model="editingCustomVpnDns" placeholder="例如 192.168.123.2，留空恢复默认" />
+        <small class="p-text-secondary">仅 Android 生效：VPN 的 DNS 查询将发往该地址（配合退出节点可实现经隧道解析）；留空则沿用 magic DNS 行为。</small>
+      </div>
+      <template #footer>
+        <Button :label="t('web.common.cancel')" icon="pi pi-times" text @click="customVpnDnsDialogVisible = false" />
+        <Button :label="t('web.common.save')" icon="pi pi-save" autofocus @click="onCustomVpnDnsSave" />
       </template>
     </Dialog>
 
