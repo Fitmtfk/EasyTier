@@ -464,9 +464,42 @@ fn normalize_tunnel_url(raw: &str, fallback_ipv6: Option<bool>) -> Option<String
     Some(format!("{scheme}://{host}:{port}"))
 }
 
+/// 隧道对端地址的族；无法判定（域名、非法 URL）为 Unknown。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelHostFamily {
+    Ipv4,
+    Ipv6,
+    Unknown,
+}
+
+/// 非特殊 scheme（tcp://、udp:// …）下 url crate 按 opaque host 解析主机名，
+/// infer_tunnel_ipv6 分不出「IPv4 字面量」和「域名」，这里只补一次字面量判定。
+fn literal_ip_family(raw: &str) -> Option<TunnelHostFamily> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => Some(TunnelHostFamily::Ipv4),
+        Ok(std::net::IpAddr::V6(_)) => Some(TunnelHostFamily::Ipv6),
+        Err(_) => None,
+    }
+}
+
 impl Url {
     pub fn is_ipv6_tunnel_endpoint(&self) -> bool {
         infer_tunnel_ipv6(&self.url).unwrap_or(false)
+    }
+
+    /// 对端地址的族；域名或无法解析的 URL 返回 Unknown。
+    pub fn tunnel_host_family(&self) -> TunnelHostFamily {
+        match infer_tunnel_ipv6(&self.url) {
+            Some(true) => TunnelHostFamily::Ipv6,
+            Some(false) => TunnelHostFamily::Ipv4,
+            None => literal_ip_family(&self.url).unwrap_or(TunnelHostFamily::Unknown),
+        }
     }
 
     pub fn normalized_tunnel_display(&self) -> String {
@@ -597,7 +630,7 @@ impl SecureModeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{TunnelInfo, Url, normalize_tunnel_url};
+    use super::{TunnelHostFamily, TunnelInfo, Url, normalize_tunnel_url};
 
     fn assert_ipv6_tunnel_normalization(scheme: &str, port: u16) {
         let expected = format!("{scheme}6://[2001:db8::1]:{port}");
@@ -704,6 +737,39 @@ mod tests {
             tunnel.display_remote_addr().as_deref(),
             Some("tcp6://[2001:db8::2]:11010")
         );
+    }
+
+    #[test]
+    fn tunnel_host_family_detects_ip_and_domain() {
+        let v4 = Url {
+            url: "tcp://1.2.3.4:11010".to_string(),
+        };
+        let v6 = Url {
+            url: "tcp://[2001:db8::1]:11010".to_string(),
+        };
+        let domain = Url {
+            url: "tcp://example.com:11010".to_string(),
+        };
+        let garbage = Url {
+            url: "not a url".to_string(),
+        };
+
+        assert_eq!(v4.tunnel_host_family(), TunnelHostFamily::Ipv4);
+        assert_eq!(v6.tunnel_host_family(), TunnelHostFamily::Ipv6);
+        assert_eq!(domain.tunnel_host_family(), TunnelHostFamily::Unknown);
+        assert_eq!(garbage.tunnel_host_family(), TunnelHostFamily::Unknown);
+
+        // tcp://、udp:// 不是 url crate 的特殊 scheme，主机名按 opaque host 解析，
+        // IPv4 字面量不能被当成域名。
+        let udp_v4 = Url {
+            url: "udp://192.168.1.10:11010".to_string(),
+        };
+        assert_eq!(udp_v4.tunnel_host_family(), TunnelHostFamily::Ipv4);
+
+        let not_an_ip = Url {
+            url: "tcp://999.1.1.1:11010".to_string(),
+        };
+        assert_eq!(not_an_ip.tunnel_host_family(), TunnelHostFamily::Unknown);
     }
 
     #[test]

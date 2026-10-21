@@ -28,6 +28,7 @@ use crate::{
 };
 
 use super::{
+    family::ConnFamily,
     peer::Peer,
     peer_conn::{PeerConn, PeerConnId},
 };
@@ -142,6 +143,13 @@ impl PeerMap {
 
     pub fn has_peer(&self, peer_id: PeerId) -> bool {
         peer_id == self.my_peer_id || self.peer_map.contains_key(&peer_id)
+    }
+
+    /// peer 不在本地 map 时返回 false。
+    pub fn has_conn_of_family(&self, peer_id: PeerId, family: ConnFamily) -> bool {
+        self.get_peer_by_id(peer_id)
+            .map(|peer| peer.has_conn_of_family(family))
+            .unwrap_or(false)
     }
 
     pub(crate) fn has_direct_attached_peer(&self, peer_id: PeerId) -> bool {

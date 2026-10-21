@@ -53,6 +53,7 @@ use super::{
     PeerPacketFilter, PeerPacketFilterResult, PeerPacketIngress,
     acl::AclFilter,
     conn::{
+        family::{ConnFamily, ConnFamilyPref},
         peer_conn::{PeerConn, PeerConnId},
         peer_map::{PeerMap, direct_peer_info},
         peer_session::PeerSessionStore,
@@ -1578,6 +1579,22 @@ impl PeerManagerCore {
         } else {
             self.foreign_network_client.get_peer_map().has_peer(peer_id)
         }
+    }
+
+    /// 该 peer 是否已有指定族的连接（含打洞得到的连接）。
+    pub fn has_conn_of_family(&self, peer_id: PeerId, family: ConnFamily) -> bool {
+        if let Some(peer) = self.peers.get_peer_by_id(peer_id) {
+            peer.has_conn_of_family(family)
+        } else {
+            self.foreign_network_client
+                .get_peer_map()
+                .has_conn_of_family(peer_id, family)
+        }
+    }
+
+    /// 当前生效的直连族偏好（实时读取，支持运行期修改）。
+    pub fn direct_conn_family(&self) -> ConnFamilyPref {
+        ConnFamilyPref::from_flag_str(&self.context.flags().direct_conn_family)
     }
 
     pub async fn add_client_tunnel(

@@ -29,6 +29,7 @@ use snow::{HandshakeState, params::NoiseParams};
 use crate::foundation::time::{Duration, timeout};
 
 use super::{
+    family::{ConnFamily, tunnel_info_family},
     peer_conn_liveness::{FEATURE as LIVENESS_ECHO_FEATURE, PeerConnLiveness},
     peer_conn_ping::PeerConnPinger,
     peer_session::{PeerSession, PeerSessionAction},
@@ -443,6 +444,12 @@ impl PeerConn {
             self.origin,
             PeerConnectionOrigin::TcpHolePunch | PeerConnectionOrigin::UdpHolePunch
         )
+    }
+
+    /// 该连接对端的地址族；无法判定时为 Unknown。
+    /// 不走 get_conn_info()，握手前调用不会 panic。
+    pub fn remote_host_family(&self) -> ConnFamily {
+        tunnel_info_family(self.tunnel_info.as_ref())
     }
 
     fn max_ping_interval(&self) -> Duration {

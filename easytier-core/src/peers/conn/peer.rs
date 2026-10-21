@@ -9,6 +9,7 @@ use tokio::{select, sync::mpsc};
 
 use tracing::Instrument;
 
+use super::family::{ConnFamily, conn_counts_as_family};
 use super::peer_conn::{PeerConn, PeerConnId};
 use crate::peers::{
     PacketRecvChan,
@@ -292,6 +293,15 @@ impl Peer {
             .any(|entry| !entry.value().is_closed() && !entry.value().is_hole_punched())
     }
 
+    /// 是否存在未关闭、且族为 family 的连接。
+    /// 与 has_directly_connected_conn 不同：**包含打洞得到的连接**。
+    pub fn has_conn_of_family(&self, family: ConnFamily) -> bool {
+        self.conns.iter().any(|entry| {
+            let conn = entry.value();
+            conn_counts_as_family(conn.remote_host_family(), conn.is_closed(), family)
+        })
+    }
+
     pub(crate) fn has_direct_attached_conn(&self) -> bool {
         self.conns.iter().any(|entry| {
             let conn = entry.value();
@@ -339,7 +349,83 @@ impl Drop for Peer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::conn_latency_sort_key;
+    use super::{ConnFamily, Peer, conn_counts_as_family};
+    use crate::peers::conn::peer_conn::PeerConn;
+    use crate::peers::conn::peer_session::PeerSessionStore;
+    use crate::peers::test_support::NoopPeerContext;
+    use crate::peers::{PeerConnectionOrigin, create_packet_recv_chan};
+    use crate::proto::common::TunnelInfo;
+    use crate::tunnel::ring::{RingTunnel, create_ring_socket_pair};
+
+    fn tunnel_with_remote_addr(remote_addr: &str) -> Box<dyn crate::tunnel::Tunnel> {
+        let (socket, _peer_socket) = create_ring_socket_pair(16);
+        let info = TunnelInfo {
+            tunnel_type: "ring".to_owned(),
+            local_addr: None,
+            remote_addr: Some(crate::proto::common::Url {
+                url: remote_addr.to_owned(),
+            }),
+            resolved_remote_addr: None,
+        };
+        Box::new(RingTunnel::new(socket, Some(info)))
+    }
+
+    #[tokio::test]
+    async fn family_predicate_counts_hole_punched_conn() {
+        let context = Arc::new(NoopPeerContext::default());
+        let conn = PeerConn::new_with_peer_id_hint_and_origin(
+            1,
+            context.clone(),
+            tunnel_with_remote_addr("tcp://1.2.3.4:11010"),
+            None,
+            Arc::new(PeerSessionStore::new()),
+            PeerConnectionOrigin::UdpHolePunch,
+        );
+        assert!(conn.is_hole_punched(), "conn should be hole punched");
+        assert_eq!(conn.remote_host_family(), ConnFamily::Ipv4);
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context);
+        let conn_id = conn.get_conn_id();
+        peer.conns.insert(conn_id, Arc::new(conn));
+
+        // 打洞连接不算「直连」，但必须算作「已有该族的连接」。
+        assert!(!peer.has_directly_connected_conn());
+        assert!(peer.has_conn_of_family(ConnFamily::Ipv4));
+        assert!(!peer.has_conn_of_family(ConnFamily::Ipv6));
+        assert!(!peer.has_conn_of_family(ConnFamily::Unknown));
+
+        // 未握手的连接没有 info，get_conn_info() 会 panic（上游既有行为），
+        // 因此先摘掉连接再让 Peer 析构。
+        peer.conns.remove(&conn_id);
+    }
+
+    #[test]
+    fn family_predicate_excludes_closed_and_unknown() {
+        assert!(conn_counts_as_family(
+            ConnFamily::Ipv4,
+            false,
+            ConnFamily::Ipv4
+        ));
+        assert!(!conn_counts_as_family(
+            ConnFamily::Ipv4,
+            true,
+            ConnFamily::Ipv4
+        ));
+        assert!(!conn_counts_as_family(
+            ConnFamily::Unknown,
+            false,
+            ConnFamily::Ipv4
+        ));
+        assert!(!conn_counts_as_family(
+            ConnFamily::Unknown,
+            false,
+            ConnFamily::Ipv6
+        ));
+    }
 
     #[test]
     fn measured_relay_precedes_unverified_hole_punch_path() {
