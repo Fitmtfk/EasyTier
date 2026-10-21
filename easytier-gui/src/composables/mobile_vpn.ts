@@ -10,6 +10,7 @@ import {
   type VpnTileAction,
 } from 'tauri-plugin-vpnservice-api'
 import { collectNetworkInfo, getConfig, getMobileTunConfig, listNetworkInstanceIds, setTunFd } from './backend'
+import { isValidIpv4, loadCustomVpnDns } from './config'
 
 interface vpnStatus {
   running: boolean
@@ -43,6 +44,16 @@ function reportRejectedMembers(config: MobileTunConfig) {
   if (errors && errors !== vpnMemberErrors)
     vpnErrorHandler?.(errors)
   vpnMemberErrors = errors
+}
+
+// A user supplied DNS server takes precedence over the DNS reported by the core
+// (e.g. magic DNS), so that DNS queries can be routed through the tunnel.
+function resolveVpnDns(coreDns: string | undefined): string | undefined {
+  const customDns = loadCustomVpnDns()
+  if (customDns !== null && isValidIpv4(customDns)) {
+    return customDns
+  }
+  return coreDns
 }
 
 const curVpnStatus: vpnStatus = {
@@ -218,6 +229,7 @@ async function doStartVpn(
   ipv4Addrs: string[],
   routes: string[],
   dns: string | undefined,
+  coreDns: string | undefined,
 ) {
   if (curVpnStatus.running) {
     return
@@ -257,7 +269,7 @@ async function doStartVpn(
   vpnAttachedInstanceIds = [...actual.instance_ids].sort()
   if (JSON.stringify(actual.addresses) !== JSON.stringify(ipv4Addrs)
     || JSON.stringify(actual.routes) !== JSON.stringify(routes)
-    || (actual.dns ?? undefined) !== dns) {
+    || (actual.dns ?? undefined) !== coreDns) {
     scheduleVpnReconcile(vpnReconcileGeneration, 'attachment_configuration_changed')
   }
 }
@@ -429,7 +441,8 @@ async function reconcileNetworkInstance(generation: number) {
   const sortedIpv4Addrs = [...config.addresses].sort()
   const sortedRoutes = [...config.routes].sort()
   const instanceIds = [...config.instance_ids].sort()
-  const dns = config.dns ?? undefined
+  const coreDns = config.dns ?? undefined
+  const dns = resolveVpnDns(coreDns)
   // A replacement runtime needs its own attachment even with identical OS routes.
   const membersChanged = JSON.stringify(instanceIds) !== JSON.stringify(vpnAttachedInstanceIds)
   const configChanged
@@ -451,7 +464,7 @@ async function reconcileNetworkInstance(generation: number) {
       return
 
     try {
-      await doStartVpn(instanceIds, sortedIpv4Addrs, sortedRoutes, dns)
+      await doStartVpn(instanceIds, sortedIpv4Addrs, sortedRoutes, dns, coreDns)
       if (!isCurrentVpnReconcile(generation))
         await doStopVpn()
     }

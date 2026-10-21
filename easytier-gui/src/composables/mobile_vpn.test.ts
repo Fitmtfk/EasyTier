@@ -64,6 +64,14 @@ vi.mock('./backend', () => ({
   setTunFd: mocks.setTunFd,
 }))
 
+const localStorageStore = new Map<string, string>()
+vi.stubGlobal('localStorage', {
+  getItem: (key: string) => localStorageStore.get(key) ?? null,
+  setItem: (key: string, value: string) => { localStorageStore.set(key, value) },
+  removeItem: (key: string) => { localStorageStore.delete(key) },
+  clear: () => localStorageStore.clear(),
+})
+
 function makeMobileTunConfig(instanceIds: string[]): MobileTunConfig {
   const addresses: string[] = []
   const routes = new Set<string>()
@@ -138,6 +146,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   vi.clearAllTimers()
   vi.resetModules()
+  localStorageStore.clear()
   mocks.listeners.clear()
   mocks.configs.clear()
   mocks.networkInfo.clear()
@@ -646,5 +655,57 @@ describe('mobile VPN tile action delivery', () => {
 
     expect(await vpn.consumePendingMobileVpnTileAction()).toBe(true)
     expect(handler).toHaveBeenCalledWith('start')
+  })
+})
+
+describe('custom VPN DNS', () => {
+  it('prefers the custom DNS server over the DNS reported by the core', async () => {
+    setConfig('A')
+    mocks.configs.get('A')!.enable_magic_dns = true
+    setReady('A', '10.0.0.1')
+    localStorageStore.set('custom_vpn_dns', '192.168.123.2')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
+      dns: '192.168.123.2',
+    }))
+  })
+
+  it('ignores an invalid custom DNS server and keeps the core DNS', async () => {
+    setConfig('A')
+    mocks.configs.get('A')!.enable_magic_dns = true
+    setReady('A', '10.0.0.1')
+    localStorageStore.set('custom_vpn_dns', '192.168.123.999')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
+      dns: '100.100.100.101',
+    }))
+  })
+
+  it('leaves the DNS unset when no custom DNS server is configured', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    expect(mocks.startVpn).toHaveBeenCalledWith(expect.objectContaining({
+      dns: undefined,
+    }))
+  })
+
+  it('restarts the VPN when the custom DNS server changes', async () => {
+    setConfig('A')
+    setReady('A', '10.0.0.1')
+    localStorageStore.set('custom_vpn_dns', '192.168.123.2')
+    const vpn = await loadVpnModule()
+    await vpn.onNetworkInstanceChange('A')
+    expect(mocks.startVpn).toHaveBeenCalledOnce()
+
+    localStorageStore.set('custom_vpn_dns', '192.168.123.3')
+    await vpn.onNetworkInstanceChange('A')
+    expect(mocks.stopVpn).toHaveBeenCalledOnce()
+    expect(mocks.startVpn).toHaveBeenLastCalledWith(expect.objectContaining({
+      dns: '192.168.123.3',
+    }))
   })
 })

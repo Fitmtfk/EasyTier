@@ -32,3 +32,42 @@ export function loadVpnTileStoppedInstanceIds(): string[] {
         return []
     }
 }
+
+const CUSTOM_VPN_DNS_KEY = 'custom_vpn_dns'
+
+/**
+ * 校验字符串是否为合法 IPv4 地址（点分四段，每段 0-255，不允许前导零）
+ * @param value 待校验字符串
+ */
+export function isValidIpv4(value: string): boolean {
+    const parts = value.split('.')
+    if (parts.length !== 4) {
+        return false
+    }
+    return parts.every(part => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)
+}
+
+/**
+ * 保存自定义 VPN DNS（仅 Android 生效）。传 null 或空串表示清除
+ * @param dns IPv4 地址字符串，或 null 表示不启用
+ */
+export function saveCustomVpnDns(dns: string | null) {
+    if (dns === null || dns.trim().length === 0) {
+        localStorage.removeItem(CUSTOM_VPN_DNS_KEY)
+        return
+    }
+    localStorage.setItem(CUSTOM_VPN_DNS_KEY, dns.trim())
+}
+
+/**
+ * 加载自定义 VPN DNS
+ * @returns 自定义 DNS 字符串，未设置则为 null
+ */
+export function loadCustomVpnDns(): string | null {
+    const value = localStorage.getItem(CUSTOM_VPN_DNS_KEY)
+    if (value === null) {
+        return null
+    }
+    const trimmed = value.trim()
+    return trimmed.length ? trimmed : null
+}
