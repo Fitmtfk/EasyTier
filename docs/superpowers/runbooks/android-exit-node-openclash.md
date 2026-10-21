@@ -167,3 +167,12 @@ git am ..\easytier-patches\*.patch
 push `releases/mine` 后 fork 的 `.github/workflows/mobile.yml` 会自动构建
 4 ABI release APK；若产物签名不可安装，退回本地构建签名 APK
 （`corepack pnpm --dir easytier-gui tauri android build --apk`）。
+
+### 与上游的两处已知偏离
+
+- `.github/workflows/gui.yml`：摘掉了矩阵里的 2 个 darwin 目标（fork 没有
+  `APPLE_*` 签名密钥，macOS 腿会失败并因 `fail-fast` 拖垮整个矩阵）。darwin
+  专属步骤保留在文件里，补回 8 行即可恢复。上游若改动 `gui.yml`，rebase 时
+  这里可能冲突，属预期内。
+- 其它上游文件一律不改动；`main` 始终是上游的镜像（fork 的 `main` 里的
+  `gui.yml` 仍是上游版本，在 `main` 上触发构建会重现 macOS 失败）。
