@@ -21,7 +21,7 @@
 5. `Unknown`（域名等无法判定的族）：**发起层不算**偏好族连接；**选路层与偏好族同级**（排在偏好族之后、非偏好族之前）。
 6. `auto` 必须与上游**逐位一致**：排序键第二分量恒为 0；发起侧五处判定保持原样；无轮次上限与冷却；打洞层跳过条件保持原样。
 7. 不得改动：IPv6 监听开关、中继/relay 选路、协议与线格式、退出节点行为。
-8. 前端生成物 `easytier-web/frontend-lib/src/generated/proto/**` 必须用 `pnpm codegen:proto` 重新生成并提交，**不要手工编辑生成物**。
+8. 前端生成物 `easytier-web/frontend-lib/src/generated/proto/**` 必须用 `pnpm codegen:proto` 重新生成，**不要手工编辑生成物**。⚠️ 该目录被 `.gitignore:37` 忽略（`git ls-files` 为空），**不入库**，本地生成后确认字段存在即可。
 9. 前端 spec 中的 `CONFIG_FLAG_FIELDS` / `CONFIG_CHECKBOX_FIELDS` / `CONFIG_TOGGLE_FIELDS` / `CONFIG_UI_BOOLEAN_FIELDS` **不得**加入新字段（它们都是 bool 清单）。
 10. 每个 Task 至少一次 commit，message 用英文祈使句（如 `feat(core): add direct_conn_family flag`）。
 11. Rust 侧无入库生成物：proto 改动只需 `cargo build -p easytier-proto`（`easytier-proto/src/common.rs` 的 `Flags::flags()` 运行期读描述符）。
@@ -236,7 +236,7 @@
     git status --porcelain
     ```
 
-    期望 `src/generated/proto/common.ts` 与 `src/generated/proto/api_manage.ts` 出现 `direct_conn_family`；**只提交生成物，不要手工改**。
+    期望 `src/generated/proto/common.ts` 与 `src/generated/proto/api_manage.ts` 出现 `direct_conn_family`；**生成物在 .gitignore 内不入库**（`.gitignore:37`），本地确认字段存在即可，**不要手工改**。
 
 11. 跑测试：
 
@@ -249,7 +249,7 @@
 12. 提交：
 
     ```bash
-    git add easytier-proto/proto easytier-core/src/config/api_input.rs easytier-core/src/management/full/config_patch.rs easytier-core/src/wasi/web_client.rs easytier/src/instance/runtime_host.rs easytier-web/src/client_manager/runtime_reconcile.rs easytier/locales/app.yml easytier-web/frontend-lib/src/generated/proto
+    git add easytier-proto/proto easytier-core/src/config/api_input.rs easytier-core/src/management/full/config_patch.rs easytier-core/src/wasi/web_client.rs easytier/src/instance/runtime_host.rs easytier-web/src/client_manager/runtime_reconcile.rs easytier/locales/app.yml
     git commit -m "feat(proto): add direct_conn_family flag for direct connection family preference"
     ```
 
