@@ -58,6 +58,7 @@ use super::manual::{
     resolve_url_addrs,
 };
 
+mod family_filter;
 mod udp;
 
 const DIRECT_CONNECTOR_BLACKLIST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -346,7 +347,7 @@ where
                 ) && data.peer_manager.has_recent_traffic(route.peer_id, now);
                 route.peer_id != my_peer_id
                     && (static_allowed || dynamic_allowed)
-                    && !data.peer_manager.has_directly_connected_conn(route.peer_id)
+                    && !data.peer_satisfied(route.peer_id)
                     && !data.peer_blacklist.contains(&route.peer_id)
             })
             .map(|route| route.peer_id)
@@ -367,6 +368,24 @@ impl<H> DirectConnectorData<H>
 where
     H: DirectConnectorHost,
 {
+    /// 直连需求是否已被满足（族感知）。
+    ///
+    /// - `auto`：与上游完全一致 ——「已有直连连接」即视为满足。
+    /// - `prefer_ipv4` / `prefer_ipv6`：只有「已有偏好族连接」才视为满足；
+    ///   另一族（例如 IPv6）的连接**不**代表偏好族已打通，应继续尝试偏好族。
+    ///
+    /// 判定走 `has_conn_of_family`（**含打洞得到的连接**），不用
+    /// `has_directly_connected_conn`（它把打洞连接排除在外，会导致
+    /// 「打通了还一直重试 + listener 被 300s 拉黑」）。
+    fn peer_satisfied(&self, dst_peer_id: PeerId) -> bool {
+        let prefer = self.peer_manager.direct_conn_family();
+        family_filter::peer_satisfied_by(
+            prefer,
+            |family| self.peer_manager.has_conn_of_family(dst_peer_id, family),
+            || self.peer_manager.has_directly_connected_conn(dst_peer_id),
+        )
+    }
+
     async fn try_direct_connect(self: Arc<Self>, dst_peer_id: PeerId) -> anyhow::Result<()> {
         let backoffs_ms = [1000, 2000, 2000, 5000, 5000, 10000, 30000, 60000];
         let mut backoff_index = 0usize;
@@ -410,7 +429,7 @@ where
                 .try_direct_connect_with_ip_list(dst_peer_id, ip_list)
                 .await;
             tracing::info!(?result, dst_peer_id, "direct-connect attempt returned");
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self.peer_satisfied(dst_peer_id) {
                 return Ok(());
             }
         }
@@ -421,7 +440,7 @@ where
         dst_peer_id: PeerId,
         ip_list: GetIpListResponse,
     ) -> anyhow::Result<()> {
-        let mut available_listeners = ip_list
+        let available_listeners = ip_list
             .listeners
             .clone()
             .into_iter()
@@ -434,6 +453,17 @@ where
                 self.options.enable_ipv6 || !matches!(listener.host(), Some(Host::Ipv6(_)))
             })
             .collect::<Vec<_>>();
+
+        // 族偏好过滤：只保留偏好族的字面量 listener（域名放行，由 IpVersion 控族）。
+        // 偏好族自己的 unspecified listener（`0.0.0.0` / `[::]`）因此被保留 ——
+        // 它是本族候选地址的唯一展开源。
+        // `auto` 时原样返回，行为与上游逐位一致。
+        let prefer = self.peer_manager.direct_conn_family();
+        let mut available_listeners = family_filter::filter_listeners_by_prefer_family(
+            available_listeners,
+            prefer,
+            |listener: &Url| listener.as_str(),
+        );
 
         if available_listeners.is_empty() {
             anyhow::bail!("peer {dst_peer_id} has no valid listener");
@@ -465,7 +495,7 @@ where
                     .await;
             }
             let _ = tasks.join_all().await;
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self.peer_satisfied(dst_peer_id) {
                 return Ok(());
             }
         }
@@ -596,11 +626,11 @@ where
 
         let backoffs_ms = [1000i64, 2000, 4000];
         for attempt in 0..=backoffs_ms.len() {
-            if self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if self.peer_satisfied(dst_peer_id) {
                 return Ok(());
             }
             let result = self.connect_to_url_once(dst_peer_id, &url).await;
-            if result.is_ok() || self.peer_manager.has_directly_connected_conn(dst_peer_id) {
+            if result.is_ok() || self.peer_satisfied(dst_peer_id) {
                 return Ok(());
             }
             if attempt == backoffs_ms.len() {
@@ -662,7 +692,10 @@ where
             self.dns.as_ref(),
             &normalized,
             default_port,
-            self.options.socket_context(transport, IpVersion::Both),
+            self.options.socket_context(
+                transport,
+                family_filter::prefer_ip_version(self.peer_manager.direct_conn_family()),
+            ),
         )
         .await?;
         let bind_addrs = if self.options.bind_device
