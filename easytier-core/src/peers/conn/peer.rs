@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arc_swap::ArcSwapOption;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::{DashMap, DashSet};
 use parking_lot::{Mutex, RwLock};
@@ -9,7 +9,7 @@ use tokio::{select, sync::mpsc};
 
 use tracing::Instrument;
 
-use super::family::{ConnFamily, conn_counts_as_family};
+use super::family::{ConnFamily, ConnFamilyPref, conn_counts_as_family};
 use super::peer_conn::{PeerConn, PeerConnId};
 use crate::peers::{
     PacketRecvChan,
@@ -32,6 +32,23 @@ fn conn_latency_sort_key(latency_us: u64, is_hole_punched: bool) -> (bool, u64) 
     (is_hole_punched && latency_us == 0, latency_us)
 }
 
+/// 直连族偏好缓存的刷新周期：运行期改 `direct_conn_family` 后最多 5 秒生效（无需重启实例）。
+const PREFER_FAMILY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 连接排序键：分量顺序不可调换。
+/// 1. 刚打洞进来、首个 ping 未确认的连接排最后（上游语义）。
+/// 2. 族排位：偏好族 0、Unknown 1、另一族 2；Auto 恒 0（与上游同序）。
+/// 3. 同族内按延迟。
+fn conn_sort_key(
+    latency_us: u64,
+    is_hole_punched: bool,
+    family: ConnFamily,
+    prefer: ConnFamilyPref,
+) -> (bool, u8, u64) {
+    let (unconfirmed, latency) = conn_latency_sort_key(latency_us, is_hole_punched);
+    (unconfirmed, prefer.family_rank(family), latency)
+}
+
 pub struct Peer {
     pub peer_node_id: PeerId,
     conns: ConnMap,
@@ -51,6 +68,13 @@ pub struct Peer {
     peer_public_key: Arc<RwLock<Option<Vec<u8>>>>,
     #[allow(dead_code)]
     default_conn_clear_task: AbortOnDropHandle<()>,
+
+    /// 直连族偏好缓存；每 5 秒刷新一次（见 prefer_family_refresh_task）。
+    /// 运行期改 `direct_conn_family` 后最多 5 秒生效，不需要重启实例。
+    prefer_family: Arc<ArcSwap<ConnFamilyPref>>,
+    /// 偏好缓存刷新任务句柄；存进 Peer，随 Peer drop 而 abort，不能丢。
+    #[allow(dead_code)]
+    prefer_family_refresh_task: AbortOnDropHandle<()>,
 }
 
 impl Peer {
@@ -141,6 +165,23 @@ impl Peer {
             }
         }));
 
+        // 直连族偏好：初始值取当前旗标，之后每 5 秒刷新一次，
+        // 运行期改开关最多 5 秒生效（不需要重启实例）。
+        let prefer_family = Arc::new(ArcSwap::from_pointee(ConnFamilyPref::from_flag_str(
+            &context.flags().direct_conn_family,
+        )));
+        let prefer_family_copy = prefer_family.clone();
+        let prefer_context_copy = context.clone();
+        let prefer_family_refresh_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                crate::foundation::time::sleep(PREFER_FAMILY_REFRESH_INTERVAL).await;
+                let pref = ConnFamilyPref::from_flag_str(
+                    &prefer_context_copy.flags().direct_conn_family,
+                );
+                prefer_family_copy.store(Arc::new(pref));
+            }
+        }));
+
         Peer {
             peer_node_id,
             conns,
@@ -156,6 +197,8 @@ impl Peer {
             peer_identity_type,
             peer_public_key,
             default_conn_clear_task,
+            prefer_family,
+            prefer_family_refresh_task,
         }
     }
 
@@ -221,21 +264,45 @@ impl Peer {
         // A zero latency on a hole-punched connection means the ping loop has not
         // confirmed liveness yet. Prefer any other connection, so a freshly admitted
         // hole-punched path cannot steal traffic before its first successful ping.
-        let selected = self
-            .conns
-            .iter()
-            .min_by_key(|conn| {
-                conn_latency_sort_key(
-                    conn.value().get_stats().latency_us,
-                    conn.value().is_hole_punched(),
-                )
-            })
-            .map(|conn| conn.value().clone());
+        //
+        // `auto` 时走上游原路径（排序键完全一致），保证与上游逐位一致：
+        // 上游是 min_by_key(conn_latency_sort_key)，并列时取首个最小值。
+        // 只有显式指定偏好族时才把族分量插进排序键。
+        let prefer = *self.prefer_family.load_full();
+        let selected = if prefer == ConnFamilyPref::Auto {
+            self.conns
+                .iter()
+                .min_by_key(|conn| {
+                    conn_latency_sort_key(
+                        conn.value().get_stats().latency_us,
+                        conn.value().is_hole_punched(),
+                    )
+                })
+                .map(|conn| conn.value().clone())
+        } else {
+            self.conns
+                .iter()
+                .min_by_key(|conn| {
+                    let conn = conn.value();
+                    conn_sort_key(
+                        conn.get_stats().latency_us,
+                        conn.is_hole_punched(),
+                        conn.remote_host_family(),
+                        prefer,
+                    )
+                })
+                .map(|conn| conn.value().clone())
+        };
 
         if let Some(conn) = selected.as_ref() {
             self.default_conn.store(Some(conn.clone()));
         }
         selected
+    }
+
+    /// 当前生效的直连族偏好（5 秒缓存；运行期改开关最多 5 秒内生效）。
+    pub(crate) fn prefer_family(&self) -> ConnFamilyPref {
+        *self.prefer_family.load_full()
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
@@ -351,10 +418,14 @@ impl Drop for Peer {
 mod tests {
     use std::sync::Arc;
 
+    use arc_swap::ArcSwap;
+    use easytier_proto::common::Flags;
+
     use super::conn_latency_sort_key;
-    use super::{ConnFamily, Peer, conn_counts_as_family};
+    use super::{ConnFamily, ConnFamilyPref, Peer, conn_counts_as_family, conn_sort_key};
     use crate::peers::conn::peer_conn::PeerConn;
     use crate::peers::conn::peer_session::PeerSessionStore;
+    use crate::peers::context::{ArcPeerContext, NetworkIdentity, PeerContext};
     use crate::peers::test_support::NoopPeerContext;
     use crate::peers::{PeerConnectionOrigin, create_packet_recv_chan};
     use crate::proto::common::TunnelInfo;
@@ -371,6 +442,45 @@ mod tests {
             resolved_remote_addr: None,
         };
         Box::new(RingTunnel::new(socket, Some(info)))
+    }
+
+    /// 构造一条指定对端地址、指定来源的连接。
+    fn conn_with_remote_addr(
+        context: &ArcPeerContext,
+        remote_addr: &str,
+        origin: PeerConnectionOrigin,
+    ) -> PeerConn {
+        PeerConn::new_with_peer_id_hint_and_origin(
+            1,
+            context.clone(),
+            tunnel_with_remote_addr(remote_addr),
+            None,
+            Arc::new(PeerSessionStore::new()),
+            origin,
+        )
+    }
+
+    /// 带指定 direct_conn_family 旗标的 PeerContext。
+    fn context_with_prefer(flag: &str) -> ArcPeerContext {
+        let mut flags = Flags::default();
+        flags.direct_conn_family = flag.to_owned();
+        Arc::new(NoopPeerContext::default().with_flags(flags))
+    }
+
+    /// 可运行期改旗标的 PeerContext（用于验证 5 秒刷新）。
+    struct MutableFlagsContext {
+        base: NoopPeerContext,
+        flags: Arc<ArcSwap<Flags>>,
+    }
+
+    impl PeerContext for MutableFlagsContext {
+        fn network_identity(&self) -> NetworkIdentity {
+            self.base.network_identity()
+        }
+
+        fn flags(&self) -> Flags {
+            self.flags.load_full().as_ref().clone()
+        }
     }
 
     #[tokio::test]
@@ -440,5 +550,167 @@ mod tests {
     #[test]
     fn verified_lower_latency_path_can_be_preferred() {
         assert!(conn_latency_sort_key(5_000, true) < conn_latency_sort_key(20_000, false));
+    }
+
+    // ---- 族偏好排序键（Task 3）----
+
+    #[test]
+    fn auto_preference_matches_upstream_ordering() {
+        use ConnFamily::*;
+        let auto = ConnFamilyPref::Auto;
+        // 上游键：(is_hole_punched && latency == 0, latency)
+        let upstream = |latency, punched| (punched && latency == 0, latency);
+        for (latency, punched) in [(0u64, true), (0, false), (5_000, true), (20_000, false)] {
+            for family in [Ipv4, Ipv6, Unknown] {
+                let new_key = conn_sort_key(latency, punched, family, auto);
+                assert_eq!(new_key.0, upstream(latency, punched).0);
+                assert_eq!(new_key.2, upstream(latency, punched).1);
+                assert_eq!(new_key.1, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn preferred_family_ranks_before_unknown_and_other_family() {
+        let v4 = ConnFamilyPref::PreferIpv4;
+        assert!(conn_sort_key(20_000, false, ConnFamily::Ipv4, v4) < conn_sort_key(0, false, ConnFamily::Unknown, v4));
+        assert!(conn_sort_key(0, false, ConnFamily::Unknown, v4) < conn_sort_key(0, false, ConnFamily::Ipv6, v4));
+
+        let v6 = ConnFamilyPref::PreferIpv6;
+        assert!(conn_sort_key(20_000, false, ConnFamily::Ipv6, v6) < conn_sort_key(0, false, ConnFamily::Unknown, v6));
+        assert!(conn_sort_key(0, false, ConnFamily::Unknown, v6) < conn_sort_key(0, false, ConnFamily::Ipv4, v6));
+    }
+
+    #[test]
+    fn unconfirmed_hole_punch_still_goes_last() {
+        let v4 = ConnFamilyPref::PreferIpv4;
+        // 刚打洞进来、首个 ping 未确认的连接，即使族匹配也不抢流量
+        assert!(conn_sort_key(0, true, ConnFamily::Ipv4, v4) > conn_sort_key(20_000, false, ConnFamily::Ipv6, v4));
+    }
+
+    #[tokio::test]
+    async fn auto_selection_matches_upstream_selection_including_ties() {
+        let context = context_with_prefer("auto");
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+
+        // 三条连接：延迟都是 0、都不是打洞 → 上游键全部并列，
+        // min_by_key 取「首个」最小值，并列时保持先出现者。
+        let v4 = conn_with_remote_addr(&context, "tcp://1.2.3.4:11010", PeerConnectionOrigin::Direct);
+        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
+        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        peer.conns.insert(v4.get_conn_id(), Arc::new(v4));
+        peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
+        peer.conns.insert(unknown.get_conn_id(), Arc::new(unknown));
+
+        // 上游算法：只按 (unconfirmed, latency) 选。
+        let upstream_pick = peer
+            .conns
+            .iter()
+            .min_by_key(|conn| {
+                conn_latency_sort_key(
+                    conn.value().get_stats().latency_us,
+                    conn.value().is_hole_punched(),
+                )
+            })
+            .map(|conn| conn.value().get_conn_id());
+        assert!(upstream_pick.is_some());
+
+        // 新键在 auto 下（族分量恒 0）必须选出同一个连接。
+        let new_pick = peer
+            .conns
+            .iter()
+            .min_by_key(|conn| {
+                let conn = conn.value();
+                conn_sort_key(
+                    conn.get_stats().latency_us,
+                    conn.is_hole_punched(),
+                    conn.remote_host_family(),
+                    ConnFamilyPref::Auto,
+                )
+            })
+            .map(|conn| conn.value().get_conn_id());
+        assert_eq!(upstream_pick, new_pick, "auto 下新键必须与上游选出同一个连接");
+
+        // select_conn 实际选中的也必须与上游一致。
+        assert_eq!(
+            peer.select_conn().map(|conn| conn.get_conn_id()),
+            upstream_pick
+        );
+
+        // 未握手的连接没有 info，get_conn_info() 会 panic（上游既有行为），
+        // 因此先摘掉连接再让 Peer 析构。
+        peer.conns.clear();
+    }
+
+    #[tokio::test]
+    async fn preferred_family_selection_prefers_preferred_family_conn() {
+        let context = context_with_prefer("prefer_ipv4");
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+        assert_eq!(peer.prefer_family(), ConnFamilyPref::PreferIpv4);
+
+        // 三条连接延迟都是 0、都不是打洞 → 上游只会按迭代顺序取首个；
+        // prefer_ipv4 下只有 v4 的族分量是 0，必须选 v4。
+        let v4 = conn_with_remote_addr(&context, "tcp://1.2.3.4:11010", PeerConnectionOrigin::Direct);
+        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
+        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        let v4_id = v4.get_conn_id();
+        peer.conns.insert(v4.get_conn_id(), Arc::new(v4));
+        peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
+        peer.conns.insert(unknown.get_conn_id(), Arc::new(unknown));
+
+        let selected = peer.select_conn().expect("should select a conn");
+        assert_eq!(selected.get_conn_id(), v4_id);
+
+        peer.conns.clear();
+    }
+
+    #[tokio::test]
+    async fn unknown_family_outranks_non_preferred_family_in_selection() {
+        let context = context_with_prefer("prefer_ipv4");
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+
+        // 没有 v4 连接：Unknown（族分量 1）必须胜过另一族（族分量 2）。
+        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
+        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        let unknown_id = unknown.get_conn_id();
+        peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
+        peer.conns.insert(unknown.get_conn_id(), Arc::new(unknown));
+
+        let selected = peer.select_conn().expect("should select a conn");
+        assert_eq!(selected.get_conn_id(), unknown_id);
+
+        peer.conns.clear();
+    }
+
+    #[tokio::test]
+    async fn prefer_family_cache_refreshes_within_five_seconds() {
+        let flags = Arc::new(ArcSwap::from_pointee(Flags::default()));
+        let context: ArcPeerContext = Arc::new(MutableFlagsContext {
+            base: NoopPeerContext::default(),
+            flags: flags.clone(),
+        });
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+        assert_eq!(peer.prefer_family(), ConnFamilyPref::Auto);
+
+        // 运行期改开关：最多 5 秒内生效，不需要重启实例。
+        let mut new_flags = flags.load_full().as_ref().clone();
+        new_flags.direct_conn_family = "prefer_ipv4".to_owned();
+        flags.store(Arc::new(new_flags));
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while peer.prefer_family() != ConnFamilyPref::PreferIpv4 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prefer family cache should refresh within 5s, got {:?}",
+                peer.prefer_family()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        peer.conns.clear();
     }
 }
