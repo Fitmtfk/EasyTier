@@ -9,7 +9,11 @@ use quanta::Instant;
 use crate::{
     config::{P2pPolicyFlags, PeerId},
     foundation::task::ExternalTaskSignal,
-    peers::{PeerConnectionOrigin, peer_manager::PeerManagerCore},
+    peers::{
+        PeerConnectionOrigin,
+        conn::family::{ConnFamily, ConnFamilyPref},
+        peer_manager::PeerManagerCore,
+    },
     proto::{
         common::NatType,
         peer_rpc::{
@@ -27,6 +31,30 @@ use super::{
     udp::{UdpHolePunchPeerSource, UdpHolePunchRpcSource, UdpPunchCandidate},
 };
 
+/// 该 peer 是否已满足「不需要再打洞」的条件。
+///
+/// - `Auto`：保持上游语义（已有任意连接就不打洞）。
+/// - `prefer_ipv4` / `prefer_ipv6`：已有偏好族连接才不打洞。
+///   例外：UDP 对称打洞只能产出 IPv4 路径，`prefer_ipv6` 下保持原样。
+///
+/// 判定用闭包注入（不直接依赖 `PeerMap`），便于测试：
+/// - `has_conn`：该 peer 是否已有**偏好族**的连接（含打洞得到的连接）。
+/// - `has_any`：该 peer 是否已有**任意**连接（上游 `has_peer` 语义）。
+pub(crate) fn has_satisfied_punch_condition(
+    has_conn: impl Fn(PeerId) -> bool,
+    has_any: impl Fn(PeerId) -> bool,
+    peer_id: PeerId,
+    prefer: ConnFamilyPref,
+    udp_only_ipv4: bool,
+) -> bool {
+    match prefer.preferred_family() {
+        // UDP 对称打洞产不出 IPv6 路径，prefer_ipv6 下保持上游语义，
+        // 否则会永远重复发起打洞。
+        Some(_) if !(udp_only_ipv4 && prefer == ConnFamilyPref::PreferIpv6) => has_conn(peer_id),
+        _ => has_any(peer_id),
+    }
+}
+
 #[async_trait]
 impl UdpHolePunchPeerSource for PeerManagerCore {
     fn local_peer_id(&self) -> PeerId {
@@ -40,6 +68,13 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
     async fn candidates(&self) -> Vec<UdpPunchCandidate> {
         let now = Instant::now();
         let peer_map = self.get_peer_map();
+        let prefer = PeerManagerCore::direct_conn_family(self);
+        // has_conn 只会在存在偏好族时被调用（见 has_satisfied_punch_condition）。
+        let has_conn = |id: PeerId| match prefer.preferred_family() {
+            Some(family) => peer_map.has_conn_of_family(id, family),
+            None => false,
+        };
+        let has_any = |id: PeerId| peer_map.has_peer(id);
         self.list_route_snapshots()
             .await
             .into_iter()
@@ -56,7 +91,13 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
                     peer_id: route.peer_id,
                     udp_nat_type,
                     feature_flag: route.feature_flag,
-                    has_direct_connection: peer_map.has_peer(route.peer_id),
+                    has_direct_connection: has_satisfied_punch_condition(
+                        &has_conn,
+                        &has_any,
+                        route.peer_id,
+                        prefer,
+                        true, // UDP 对称打洞只能产出 IPv4 路径
+                    ),
                     has_recent_traffic: self.has_recent_traffic(route.peer_id, now),
                 })
             })
@@ -141,6 +182,13 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
     async fn candidates(&self) -> Vec<TcpPunchCandidate> {
         let now = Instant::now();
         let peer_map = self.get_peer_map();
+        let prefer = PeerManagerCore::direct_conn_family(self);
+        // has_conn 只会在存在偏好族时被调用（见 has_satisfied_punch_condition）。
+        let has_conn = |id: PeerId| match prefer.preferred_family() {
+            Some(family) => peer_map.has_conn_of_family(id, family),
+            None => false,
+        };
+        let has_any = |id: PeerId| peer_map.has_peer(id);
         self.list_route_snapshots()
             .await
             .into_iter()
@@ -153,7 +201,13 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
                     .and_then(|nat_type| NatType::try_from(nat_type).ok())
                     .unwrap_or(NatType::Unknown),
                 feature_flag: route.feature_flag,
-                has_direct_connection: peer_map.has_peer(route.peer_id),
+                has_direct_connection: has_satisfied_punch_condition(
+                    &has_conn,
+                    &has_any,
+                    route.peer_id,
+                    prefer,
+                    false, // TCP 对称打洞两族都支持
+                ),
                 has_recent_traffic: self.has_recent_traffic(route.peer_id, now),
             })
             .collect()
@@ -170,6 +224,114 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
                 dst_peer_id,
                 PeerManagerCore::network_name(self).to_owned(),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::peers::conn::family::{ConnFamily, ConnFamilyPref};
+
+    const PEER: PeerId = 42;
+
+    /// 模拟一个 peer 的连接集合：peer_families 列出它已有的连接族。
+    /// 接线方式与生产代码一致：has_conn 按偏好族判定，has_any 判定「任意连接」。
+    fn punch_satisfied(
+        prefer: ConnFamilyPref,
+        udp_only_ipv4: bool,
+        peer_families: &[ConnFamily],
+    ) -> bool {
+        let preferred = prefer.preferred_family();
+        has_satisfied_punch_condition(
+            |_id| match preferred {
+                Some(family) => peer_families.contains(&family),
+                None => false,
+            },
+            |_id| !peer_families.is_empty(),
+            PEER,
+            prefer,
+            udp_only_ipv4,
+        )
+    }
+
+    #[test]
+    fn auto_keeps_upstream_skip_semantics() {
+        // Auto：上游语义 —— 已有任意连接就不打洞，没有连接才打洞。
+        assert!(!punch_satisfied(ConnFamilyPref::Auto, true, &[]));
+        assert!(!punch_satisfied(ConnFamilyPref::Auto, false, &[]));
+        assert!(punch_satisfied(
+            ConnFamilyPref::Auto,
+            true,
+            &[ConnFamily::Ipv6]
+        ));
+        assert!(punch_satisfied(
+            ConnFamilyPref::Auto,
+            false,
+            &[ConnFamily::Ipv4]
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv4_keeps_punching_when_only_ipv6_connected() {
+        // 只连上了 IPv6：偏好族没满足 → 继续发起打洞。
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            true,
+            &[ConnFamily::Ipv6]
+        ));
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            false,
+            &[ConnFamily::Ipv6]
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv4_stops_punching_after_ipv4_conn() {
+        // UDP 打洞成功后得到的正是 IPv4 连接 → 偏好族已满足，不再重复发起。
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            true,
+            &[ConnFamily::Ipv4]
+        ));
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            false,
+            &[ConnFamily::Ipv4]
+        ));
+        // 两族并存时同样满足。
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            true,
+            &[ConnFamily::Ipv4, ConnFamily::Ipv6]
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv6_does_not_count_ipv4_conn_as_ipv6() {
+        // TCP 对称打洞两族都支持：IPv4 连接不算「已有 IPv6 连接」→ 继续打洞。
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            false,
+            &[ConnFamily::Ipv4]
+        ));
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            false,
+            &[ConnFamily::Ipv6]
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv6_udp_punch_keeps_upstream_semantics() {
+        // 唯一例外：UDP 对称打洞产不出 IPv6 路径，prefer_ipv6 下保持上游语义，
+        // 否则会永远重复打洞。
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            true,
+            &[ConnFamily::Ipv4]
+        ));
+        assert!(!punch_satisfied(ConnFamilyPref::PreferIpv6, true, &[]));
     }
 }
 

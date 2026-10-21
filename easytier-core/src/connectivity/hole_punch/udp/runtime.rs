@@ -527,4 +527,32 @@ mod tests {
         drop(tunnel);
         assert!(guard_dropped.load(Ordering::Relaxed));
     }
+
+    #[tokio::test]
+    async fn udp_punched_conn_is_classified_as_ipv4_family() {
+        // UDP 对称打洞的传输固定 IPv4（bind_direct_connect_udp 固定 IpVersion::V4），
+        // 打洞成功后连接的对端地址族因此是 IPv4 —— prefer_ipv4 时它就是偏好族连接，
+        // 不能被当成「还没打洞成功」而一直重连。
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 1000));
+        let requested_remote_addr = SocketAddr::from(([198, 51, 100, 1], 2000));
+        let resolved_remote_addr = SocketAddr::from(([203, 0, 113, 1], 3000));
+        let session = UdpSession::identity_standalone(
+            Arc::new(MockSocket { local_addr }),
+            resolved_remote_addr,
+            UdpSessionKind::EasyTierMux,
+        )
+        .unwrap();
+        let socket = UdpPunchSocket::new(session, requested_remote_addr, ());
+
+        let (connected, requested_url) = socket.into_connected();
+        let tunnel =
+            crate::connectivity::protocol::raw::upgrade_connected_udp(connected, requested_url)
+                .unwrap();
+        let info = tunnel.info().unwrap();
+
+        assert_eq!(
+            crate::peers::conn::family::tunnel_info_family(Some(&info)),
+            crate::peers::conn::family::ConnFamily::Ipv4
+        );
+    }
 }
