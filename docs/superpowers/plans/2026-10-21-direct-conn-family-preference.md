@@ -1384,3 +1384,23 @@ Task 0 (环境)
 ```
 
 > Task 3、Task 4、Task 5 之间互不依赖，可并行；Task 6 依赖 Task 4 的 `peer_satisfied` 语义；Task 7 可与 3/4/5/6 并行。
+
+---
+
+## 修正轮任务（Amendment，2026-10-22）
+
+Task 3/4/5 实现完成后，实现者自报了三个真实缺陷/偏差。详见 spec §10。
+以下三个修正任务**串行执行**（共享同一个 checkout，并行会互相污染编译产物）：
+
+| 任务 | 内容 | 改动文件 | brief |
+| --- | --- | --- | --- |
+| R-9 | 发起层「另一族兜底」：偏好族全失败且该 peer 无任何连接时，允许用另一族兜底建连 | `easytier-core/src/connectivity/direct/{mod.rs,family_filter.rs}` | `.superpowers/sdd/2026-10-21-direct-conn-family-preference/amendment-r9-brief.md` |
+| R-10 | 打洞层「按传输收敛」：某传输已产出非偏好族连接 → 该传输不再重复打洞（别的传输继续） | `easytier-core/src/peers/conn/{peer_conn.rs,peer.rs,peer_map.rs}`、`easytier-core/src/connectivity/hole_punch/peer_adapters.rs` | `.../amendment-r10-brief.md` |
+| R-11 | 文档纠错（`common.proto` 注释）+ 补测试（非法值原样保留、Peer/PeerMap 级 `has_conn_of_family`） | `easytier-proto/proto/common.proto`、`easytier-core/src/config/toml.rs`、`easytier-core/src/peers/conn/{peer.rs,peer_map.rs}` | `.../polish-brief.md` |
+
+Task 6（重试预算）**在 R-9 之后**执行，并按 R-9 的语义追加 4 条强制修正
+（见 `task-6-brief.md` §9：兜底连接不算成功、放弃后可恢复、打洞层不引入预算）。
+
+评审安排：R-9/R-10/R-11 落地后并行派发只读评审 —— T3（选路层）、T4（含 R-9）、
+T5（含 R-10）、T6（预算）；评审只读，可并行。
+
