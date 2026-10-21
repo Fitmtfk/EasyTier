@@ -89,6 +89,9 @@ message Flags {
   // Prefer direct credential peers that already relay to a destination over
   // advertising another direct edge to the same destination.
   bool prefer_peer_relay = 44 [(easytier.flag) = { default: "false" }];
+
+  // Direct connection address family preference: auto / prefer_ipv4 / prefer_ipv6.
+  string direct_conn_family = 45 [(easytier.flag) = { default: "auto", form: true }];
 }
 
 

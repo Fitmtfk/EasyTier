@@ -92,6 +92,7 @@ pub(crate) fn set_network_flags(result: &mut NetworkConfig, flags: FlagsPatch) {
     result.encryption_algorithm = flags.encryption_algorithm;
     result.instance_recv_bps_limit = flags.instance_recv_bps_limit;
     result.enable_private_mode = flags.private_mode;
+    result.direct_conn_family = flags.direct_conn_family.clone();
 
     result.enable_relay_network_whitelist = flags
         .relay_network_whitelist
@@ -545,6 +546,7 @@ impl NetworkConfigExt for NetworkConfig {
             enable_udp_broadcast_relay: self.enable_udp_broadcast_relay,
             disable_sym_hole_punching: self.disable_sym_hole_punching,
             instance_recv_bps_limit: self.instance_recv_bps_limit,
+            direct_conn_family: self.direct_conn_family.clone(),
             ..Default::default()
         });
         Ok(cfg)

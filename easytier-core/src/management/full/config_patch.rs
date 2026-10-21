@@ -115,6 +115,7 @@ where
         candidate.patch_flags(FlagsPatch {
             disable_relay_data: patch.disable_relay_data,
             prefer_peer_relay: patch.prefer_peer_relay,
+            direct_conn_family: patch.direct_conn_family,
             ..Default::default()
         });
         if let Some(enabled) = patch.ipv6_public_addr_provider {

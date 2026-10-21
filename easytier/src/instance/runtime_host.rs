@@ -137,7 +137,10 @@ impl NativeInstanceRuntimeHost {
                     &config.peer,
                 ));
         }
-        if patch.disable_relay_data.is_some() || patch.prefer_peer_relay.is_some() {
+        if patch.disable_relay_data.is_some()
+            || patch.prefer_peer_relay.is_some()
+            || patch.direct_conn_family.is_some()
+        {
             self.global_ctx.set_flags(config.peer.flags.clone());
         }
     }

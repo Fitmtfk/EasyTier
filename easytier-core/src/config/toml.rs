@@ -1238,6 +1238,23 @@ socket_mark = 0
         assert_eq!(restored.get_flags().socket_mark, Some(0));
     }
 
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn toml_round_trip_preserves_direct_conn_family() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[flags]
+direct_conn_family = "prefer_ipv4"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.get_flags().direct_conn_family, "prefer_ipv4");
+
+        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
+        assert_eq!(restored.get_flags().direct_conn_family, "prefer_ipv4");
+    }
+
     #[test]
     fn legacy_vpn_portal_client_cidr_is_rejected_explicitly() {
         let error = TomlConfig::new_from_str(

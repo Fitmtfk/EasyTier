@@ -227,6 +227,9 @@ core_clap:
   prefer_peer_relay:
     en: "prefer a credential peer that already relays to a destination over advertising another direct edge to the same destination"
     zh-CN: "优先通过已经转发到目标节点的凭证节点转发，而不是为同一目标再通告一条直连路径"
+  direct_conn_family:
+    en: "preferred address family for direct connections, one of: auto, prefer_ipv4, prefer_ipv6"
+    zh-CN: "直连连接的地址族偏好，可选值：auto、prefer_ipv4、prefer_ipv6"
   enable_kcp_proxy:
     en: "proxy tcp streams with kcp, improving the latency and throughput on the network with udp packet loss."
     zh-CN: "使用 KCP 代理 TCP 流，提高在 UDP 丢包网络上的延迟和吞吐量。"

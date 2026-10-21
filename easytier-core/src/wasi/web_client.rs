@@ -130,6 +130,7 @@ fn hosted_network_config(config: &NetworkConfig) -> NetworkConfig {
         disable_upnp: config.disable_upnp,
         disable_relay_data: config.disable_relay_data,
         prefer_peer_relay: config.prefer_peer_relay,
+        direct_conn_family: config.direct_conn_family.clone(),
         enable_udp_broadcast_relay: config.enable_udp_broadcast_relay,
         managed_credentials: config.managed_credentials.clone(),
         peers,

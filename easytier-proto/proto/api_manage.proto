@@ -110,6 +110,7 @@ message NetworkConfig {
   optional string dhcp_ipv4_cidr = 74;
   optional bool dhcpv6 = 75;
   optional string dhcp_ipv6_cidr = 76;
+  optional string direct_conn_family = 77;
 }
 
 message ManagedCredentialConfig {
