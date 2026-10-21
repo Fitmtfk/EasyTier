@@ -70,6 +70,7 @@ fn hot_patch_base(config: &NetworkConfig) -> anyhow::Result<NetworkConfig> {
     config.proxy_cidrs.clear();
     config.disable_relay_data = None;
     config.prefer_peer_relay = None;
+    config.direct_conn_family = None;
     // VPN portal clients are diffed separately; the listener identity
     // (address and private key) decides between patch and recreate.
     config.vpn_portal_config = None;
@@ -1502,6 +1503,21 @@ mod tests {
 
         assert_eq!(patch.prefer_peer_relay, Some(true));
         assert_eq!(patch.disable_relay_data, None);
+    }
+
+    #[test]
+    fn runtime_patch_updates_direct_conn_family_without_recreating_instance() {
+        let current = config_with_port_forwards(Vec::new());
+        let mut desired = current.clone();
+        desired.direct_conn_family = Some("prefer_ipv4".to_string());
+
+        let patch = web_source_runtime_patch(&current, &desired, false)
+            .expect("build patch")
+            .expect("hot patch");
+
+        assert_eq!(patch.direct_conn_family, Some("prefer_ipv4".to_string()));
+        assert_eq!(patch.disable_relay_data, None);
+        assert_eq!(patch.prefer_peer_relay, None);
     }
 
     #[test]
