@@ -358,7 +358,7 @@ fn web_source_runtime_patch(
     let mut flags = FlagsPatch {
         disable_relay_data: Some(desired_flags.disable_relay_data),
         prefer_peer_relay: Some(desired_flags.prefer_peer_relay),
-        direct_conn_family: Some(desired_flags.direct_conn_family.clone()),
+        direct_conn_family: Some(desired_flags.direct_conn_family),
         ..Default::default()
     };
     flags.retain(&current_flags);

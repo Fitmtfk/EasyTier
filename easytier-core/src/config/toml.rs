@@ -1256,6 +1256,17 @@ direct_conn_family = "prefer_ipv4"
     }
 
     #[test]
+    fn direct_conn_family_defaults_to_auto_when_unset() {
+        let config = TomlConfig::new_from_str("").unwrap();
+
+        // Nothing was configured, so the value can only come from the proto
+        // default of the flag.
+        assert_eq!(config.get_flags_patch().direct_conn_family, None);
+        assert_eq!(Flags::defaults().direct_conn_family, "auto");
+        assert_eq!(config.get_flags().direct_conn_family, "auto");
+    }
+
+    #[test]
     fn legacy_vpn_portal_client_cidr_is_rejected_explicitly() {
         let error = TomlConfig::new_from_str(
             r#"

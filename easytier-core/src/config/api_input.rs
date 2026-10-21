@@ -92,7 +92,7 @@ pub(crate) fn set_network_flags(result: &mut NetworkConfig, flags: FlagsPatch) {
     result.encryption_algorithm = flags.encryption_algorithm;
     result.instance_recv_bps_limit = flags.instance_recv_bps_limit;
     result.enable_private_mode = flags.private_mode;
-    result.direct_conn_family = flags.direct_conn_family.clone();
+    result.direct_conn_family = flags.direct_conn_family;
 
     result.enable_relay_network_whitelist = flags
         .relay_network_whitelist
@@ -1015,6 +1015,27 @@ mod tests {
         assert!(flags.prefer_peer_relay);
 
         let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.disable_relay_data, Some(false));
+        assert_eq!(output.prefer_peer_relay, Some(true));
+    }
+
+    #[test]
+    fn direct_conn_family_round_trips_independently() {
+        let input = NetworkConfig {
+            disable_relay_data: Some(false),
+            prefer_peer_relay: Some(true),
+            direct_conn_family: Some("prefer_ipv6".to_owned()),
+            ..standalone_config()
+        };
+
+        let config = input.gen_config().unwrap();
+        let flags = config.get_flags();
+        assert_eq!(flags.direct_conn_family, "prefer_ipv6");
+        assert!(!flags.disable_relay_data);
+        assert!(flags.prefer_peer_relay);
+
+        let output = NetworkConfig::new_from_config(&config).unwrap();
+        assert_eq!(output.direct_conn_family, Some("prefer_ipv6".to_owned()));
         assert_eq!(output.disable_relay_data, Some(false));
         assert_eq!(output.prefer_peer_relay, Some(true));
     }

@@ -90,7 +90,13 @@ message Flags {
   // advertising another direct edge to the same destination.
   bool prefer_peer_relay = 44 [(easytier.flag) = { default: "false" }];
 
-  // Direct connection address family preference: auto / prefer_ipv4 / prefer_ipv6.
+  // Which address family a direct connection should prefer. "auto" keeps the
+  // upstream behaviour: the candidate addresses are tried in latency order and
+  // the first one that completes the handshake is used. "prefer_ipv4" and
+  // "prefer_ipv6" only reorder that list and keep the other family as a
+  // fallback, so a preference never prevents a direct connection. An empty or
+  // unknown value is handled as "auto" instead of disabling direct
+  // connections.
   string direct_conn_family = 45 [(easytier.flag) = { default: "auto", form: true }];
 }
 
