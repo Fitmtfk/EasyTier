@@ -103,14 +103,10 @@ jobs:
             GUI_TARGET: aarch64-unknown-linux-gnu
             ARTIFACT_NAME: linux-aarch64
 
-          - TARGET: x86_64-apple-darwin
-            OS: macos-latest
-            GUI_TARGET: x86_64-apple-darwin
-            ARTIFACT_NAME: macos-x86_64
-          - TARGET: aarch64-apple-darwin
-            OS: macos-latest
-            GUI_TARGET: aarch64-apple-darwin
-            ARTIFACT_NAME: macos-aarch64
+          # macOS targets are not built here: the darwin build steps require the
+          # APPLE_* signing secrets, which this fork does not have. The darwin
+          # steps below are kept so the macOS build can be re-enabled by simply
+          # adding the two matrix entries back.
 
           - TARGET: x86_64-pc-windows-msvc
             OS: windows-latest
