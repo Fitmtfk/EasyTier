@@ -1,8 +1,8 @@
 # Android 全流量退出节点 + 自定义 VPN DNS 设计
 
-日期：2026-09-02
+日期：2026-09-02（初版）；2026-09-02 同步上游后按新架构重做实现
 分支：`releases/mine`（fork: `Fitmtfk/EasyTier`，upstream: `EasyTier/EasyTier`）
-基线：upstream main @ 164e2db
+基线：upstream main @ e307dadb（初版基线为 164e2db）
 
 ## 1. 目标与背景
 
@@ -15,8 +15,11 @@ OpenClash 统一处理出口分流；同时建立可持续的补丁维护流程�
   `easytier-core/src/peers/peer_manager.rs` IPv4/IPv6 转发），GUI 高级设置已暴露
   `exit_nodes`、`enable_exit_node`、手动路由（`enable_manual_routes` + `routes`）。
 - 手动路由严格 IPv4（`cidr::Ipv4Cidr` 解析），IPv6 全流量本期不做。
-- Android VPN 的 DNS 在 `easytier-gui/src/composables/mobile_vpn.ts:363` 硬编码为
-  `enable_magic_dns ? '100.100.100.101' : undefined`。magic DNS 的转发上游在 Android 上
+- Android VPN 的 DNS 由内核侧统一计算：GUI 通过
+  `getMobileTunConfig(instanceIds)` 取 `MobileTunConfig { instance_ids, addresses, routes, dns?, rejected }`
+  （`easytier-gui/src/composables/backend.ts:90-100`），`dns` 仅在实例开启 magic DNS 时
+  为 `100.100.100.101`（`easytier/src/instance/factory/mobile_tun.rs`），否则为空；
+  上游没有提供"用户自定义手机端 DNS"的入口。magic DNS 的转发上游在 Android 上
   落到硬编码公共 DNS（223.5.5.5 / 180.184.1.1，`easytier/src/common/dns.rs`），查询从
   VPN 排除进程直接走手机本地网络 → 慢（首查超时重试）、泄漏、不经过退出节点。
 - magic DNS 对外只暴露 RPC（`tcp://127.0.0.1:49813`），不是普通 UDP DNS 端口。
@@ -33,8 +36,12 @@ OpenClash 统一处理出口分流；同时建立可持续的补丁维护流程�
   push fork → CI 出 APK。
 - 归档保险：`git format-patch main..releases/mine -o patches/`；新环境
   `git checkout -b mine && git am patches/*.patch`。
-- 原则：改动只落在 `easytier-gui/` 下 3 个文件，不触碰 Rust、proto、
+- 原则：改动只落在 `easytier-gui/` 下 4 个文件（`config.ts`、`mobile_vpn.ts`、
+  `mobile_vpn.test.ts`、`index.vue`），不触碰 Rust、proto、
   `easytier-web/frontend-lib` 等上游热区，最小化 rebase 冲突面。
+- 现实约束：上游会重构 mobile VPN（2026-09-02 的 93 个上游提交即把
+  `getRoutesForVpn` / `virtual_ipv4` / `enable_magic_dns` 全部替换为
+  `MobileTunConfig` 架构），此时 rebase 必然冲突，需要按新接口重写补丁而不是硬解冲突。
 
 ## 3. Android 端改动（唯一代码改动，全部在 easytier-gui）
 
@@ -55,14 +62,20 @@ Dialog 模式：InputText + Save/Cancel），保存时写 localStorage 并调用
 
 ### 3.3 `src/composables/mobile_vpn.ts`
 
-`reconcileNetworkInstance` 中（现 line 363）DNS 选择优先级改为：
+`reconcileNetworkInstance` 中，核心给出的 DNS 与用户自定义 DNS 分开处理：
 
-```
-custom_vpn_dns（非空且合法） > enable_magic_dns ? '100.100.100.101' : undefined
+```ts
+const coreDns = config.dns ?? undefined          // 内核计算值（magic DNS 时为 100.100.100.101）
+const dns = resolveVpnDns(coreDns)               // 自定义值合法时优先，否则用 coreDns
 ```
 
-其余传播链复用现有逻辑：`dnsChanged` 比较（line 368）已会触发 VPN 重启，
-`doStartVpn` 原样把 dns 传给 `start_vpn`。
+- `resolveVpnDns()` 读 localStorage（`loadCustomVpnDns()`），非空且 `isValidIpv4()`
+  通过时返回自定义地址，否则回退 `coreDns`。
+- `doStartVpn(...)` 额外接收 `coreDns`：附件一致性检查
+  （`(actual.dns ?? undefined) !== coreDns`）必须与内核值比较，否则自定义 DNS
+  会永远与内核值不等，触发无意义的重协商。
+- `configChanged` 比较用最终 `dns`，因此修改自定义 DNS 会触发 VPN 重启；
+  `start_vpn` 原样把 `dns` 传给 VpnService 的 `addDnsServer`。
 
 ### 3.4 数据流
 
@@ -98,9 +111,15 @@ custom_vpn_dns（非空且合法） > enable_magic_dns ? '100.100.100.101' : und
 - 自定义 DNS 留空时行为与上游一致（回退 magic DNS / 不设 DNS）。
 - 桌面端与其他平台行为零变化（改动仅在 Android 路径）。
 - push `releases/mine` → Actions 产物 APK 可安装可用。
-- `git fetch upstream && git rebase upstream/main` 干跑通过（无冲突或冲突可解）。
-- `easytier-gui` 现有单测（`pnpm test` / vitest，含 `mobile_vpn.test.ts`）通过；
-  若单测覆盖 dns 计算则补充自定义 DNS 优先级用例。
+- 同步上游后补丁仍可重放：2026-09-02 在 93 个上游提交（`e307dadb`）之上重建分支，
+  补丁按新架构重写后 `git rebase upstream/main` 无冲突。
+- `easytier-gui` 现有单测通过：命令
+  `pnpm --dir easytier-gui exec vitest run src/composables/mobile_vpn`
+  （上游 package.json 的 `test:mobile-vpn` 脚本用 glob 过滤
+  `src/composables/mobile_vpn*.test.ts`，在 vitest 2.1.9 下匹配不到任何文件，
+  需改用子串过滤；本补丁未改动上游脚本）。
+  新增用例：自定义 DNS 覆盖内核 DNS、非法值回退内核 DNS、未配置时不设 DNS、
+  修改自定义 DNS 触发 VPN 重启。
 
 ## 6. 明确不做
 

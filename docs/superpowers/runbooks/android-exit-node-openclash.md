@@ -85,6 +85,9 @@ sudo ip route add default via <VM_IP> table 100
 3. exit 节点端（同 GUI）：勾选 `enable_exit_node`。
 4. 底部菜单 → 「自定义 VPN DNS」：填 `<VM_IP>`，保存后立即生效（VPN 自动重启）。
 
+> 若实例开启了 magic DNS，内核仍会下发 `100.100.100.101/32` 路由，但系统 DNS 已被自定义
+> 地址接管，magic DNS 不再生效；可按需在实例配置中关闭 magic DNS。
+
 ## 6. 验证
 
 在 exit host 上直测 VM 解析器：
@@ -124,8 +127,8 @@ mihomo/OpenClash 无法直接把它配置为 nameserver。候选路径：easytie
 
 ## 补丁维护流程
 
-本分支改动仅落在 `easytier-gui/` 下 3 个文件（`config.ts`、`mobile_vpn.ts`、
-`index.vue`）+ 本文档，不触碰 Rust/proto，rebase 冲突面最小。
+本分支改动仅落在 `easytier-gui/` 下 4 个文件（`config.ts`、`mobile_vpn.ts`、
+`mobile_vpn.test.ts`、`index.vue`）+ 本文档，不触碰 Rust/proto，rebase 冲突面最小。
 
 ```powershell
 # remotes（一次性）
@@ -135,7 +138,24 @@ git remote add upstream https://github.com/EasyTier/EasyTier  # 上游
 # 跟进上游
 git fetch upstream
 git rebase upstream/main          # 在 releases/mine 上执行
+```
 
+**上游可能重构 mobile VPN**：2026-09-02 上游 93 个提交把 `getRoutesForVpn` /
+`virtual_ipv4` / `enable_magic_dns` 整体换成 `getMobileTunConfig()` 的
+`MobileTunConfig { instance_ids, addresses, routes, dns?, rejected }` 架构，DNS 改由
+内核计算。旧补丁 rebase 必冲突。此时**不要硬解冲突**：在 upstream/main 之上重建分支，
+按新接口重写改动（当前实现 = `mobile_vpn.ts` 的 `resolveVpnDns()` 覆盖内核
+`config.dns`，`doStartVpn` 另传 `coreDns` 供附件一致性检查）。
+
+当前实现落点（供重写时参考）：
+
+- `config.ts`：`CUSTOM_VPN_DNS_KEY` / `isValidIpv4()` / `saveCustomVpnDns()` /
+  `loadCustomVpnDns()`（localStorage key `custom_vpn_dns`）。
+- `mobile_vpn.ts`：`resolveVpnDns(coreDns)` 决定最终 DNS；`configChanged` 比较用最终
+  `dns`，改自定义 DNS 会触发 VPN 重启。
+- `index.vue`：底部菜单「自定义 VPN DNS」（仅 Android 可见）对话框。
+- 单测：`pnpm --dir easytier-gui exec vitest run src/composables/mobile_vpn`
+  （上游 `test:mobile-vpn` 脚本的 glob 在 vitest 2.1.9 下匹配不到文件）。
 # 归档补丁（仓库同级目录）
 git format-patch main..releases/mine -o ..\easytier-patches
 

@@ -12,17 +12,28 @@
 
 **工作目录:** 所有相对路径基于仓库根 `D:\Github\EasyTier`，当前分支必须是 `releases/mine`（`git branch --show-current` 验证）。
 
+> **2026-09-02 上游重构后重做：** 同步上游时发现 93 个上游提交把 mobile VPN 整体重写
+> （`getRoutesForVpn` / `virtual_ipv4` / `enable_magic_dns` 全部换成
+> `getMobileTunConfig()` 返回的 `MobileTunConfig { instance_ids, addresses, routes, dns?, rejected }`，
+> DNS 改由内核计算）。旧补丁无法直接 rebase，已按新架构重做：分支重建在
+> upstream main @ `e307dadb` 之上，Task 2 的 DNS 逻辑改为"内核 DNS + 自定义覆盖"，
+> 任务划分与验收标准不变。**下文 Task 2 Step 4b 已是新架构版本。**
+>
+> 另外：上游 package.json 的 `test:mobile-vpn` 脚本用 glob 过滤
+> `src/composables/mobile_vpn*.test.ts`，在 vitest 2.1.9 下匹配不到任何文件；
+> 实测可用命令为 `corepack pnpm --dir easytier-gui exec vitest run src/composables/mobile_vpn`。
+
 **文件结构（改动面）:**
 
 | 文件 | 操作 | 职责 |
 |---|---|---|
 | `easytier-gui/src/composables/config.ts` | 修改 | 新增 `isValidIpv4` / `saveCustomVpnDns` / `loadCustomVpnDns`（localStorage key `custom_vpn_dns`） |
-| `easytier-gui/src/composables/mobile_vpn.ts` | 修改 | reconcile 中 DNS 优先级改为 custom > magic > undefined |
-| `easytier-gui/src/composables/mobile_vpn.test.ts` | 修改 | localStorage 桩 + `setConfig` 增加 magic 参数 + 4 个 DNS 选择用例 |
+| `easytier-gui/src/composables/mobile_vpn.ts` | 修改 | 新增 `resolveVpnDns()`：自定义 DNS 覆盖内核 DNS；`doStartVpn` 透传 `coreDns` 供一致性检查 |
+| `easytier-gui/src/composables/mobile_vpn.test.ts` | 修改 | localStorage 桩 + 4 个自定义 DNS 用例（覆盖内核值 / 非法回退 / 未配置 / 变更触发重启） |
 | `easytier-gui/src/pages/index.vue` | 修改 | Android-only 菜单项 + 自定义 VPN DNS 对话框 |
 | `docs/superpowers/runbooks/android-exit-node-openclash.md` | 新建 | 退出侧运维文档（可复制命令） |
 
-不修改：`package.json`（用既有脚本 `test:mobile-vpn`）、locale 文件（新 UI 文字用中文字面量）、任何 Rust/proto/frontend-lib 文件。
+不修改：`package.json`（上游 `test:mobile-vpn` 脚本的 glob 在 vitest 2.1.9 下匹配不到文件，直接用 `pnpm exec vitest run src/composables/mobile_vpn`）、locale 文件（新 UI 文字用中文字面量）、任何 Rust/proto/frontend-lib 文件。
 
 ---
 
@@ -206,22 +217,27 @@ export function loadCustomVpnDns(): string | null {
 import { isValidIpv4, loadCustomVpnDns } from './config'
 ```
 
-4b. 把现有 line 363：
+4b. 在 reconcile 中把内核 DNS 与自定义 DNS 分开（上游新架构：DNS 来自
+`getMobileTunConfig()` 返回的 `config.dns`）：
 
 ```ts
-  const dns = config.enable_magic_dns ? '100.100.100.101' : undefined
-```
-
-替换为：
-
-```ts
+function resolveVpnDns(coreDns: string | undefined): string | undefined {
   const customDns = loadCustomVpnDns()
-  const dns = (customDns !== null && isValidIpv4(customDns))
-    ? customDns
-    : (config.enable_magic_dns ? '100.100.100.101' : undefined)
+  if (customDns !== null && isValidIpv4(customDns)) {
+    return customDns
+  }
+  return coreDns
+}
 ```
 
-其余不动（`dnsChanged` 比较与 `doStartVpn` 透传复用现有逻辑）。
+```ts
+  const coreDns = config.dns ?? undefined
+  const dns = resolveVpnDns(coreDns)
+```
+
+并把 `coreDns` 透传给 `doStartVpn`：附件一致性检查必须比较内核值
+（`(actual.dns ?? undefined) !== coreDns`），否则自定义 DNS 与内核值永远不等，
+会触发无意义的重协商。`configChanged` 比较用最终 `dns`，改自定义 DNS 即触发重启。
 
 - [ ] **Step 5: 运行测试确认全部通过**
 
