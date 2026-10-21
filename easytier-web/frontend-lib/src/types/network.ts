@@ -142,6 +142,16 @@ export function defaultFlagValue(field: keyof NetworkConfig): boolean {
   return flag ? declaredValue(flag) : false
 }
 
+/**
+ * The default a non-boolean flag's annotation declares, as the schema states
+ * it. A flag the schema declares no default for states none.
+ */
+export function defaultFlagStringValue(field: keyof NetworkConfig): string {
+  const flag = annotatedFlags.find((flag) => flag.field === field)
+
+  return flag?.meta.default ?? ''
+}
+
 /** The flags the management API carries, so a form's value reaches the backend. */
 export function apiCarries(field: string): boolean {
   return NetworkConfigPb.fields.some((declared) => declared.name === field)

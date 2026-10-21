@@ -400,6 +400,12 @@ async function setInput(wrapper: VueWrapper, selector: string, value: string) {
   await nextTick()
 }
 
+/**
+ * The protocol select of the port forwards panel. The form holds more than
+ * one select, so the panel's own header tells them apart.
+ */
+const PORT_FORWARD_PROTO_SELECT = 'section[data-header="port_forwards"] select[data-stub="select-button"]'
+
 describe('Config.vue network config projection', () => {
   it('projects config values into the visible form controls', async () => {
     const { curNetwork, wrapper } = mountConfig()
@@ -428,7 +434,7 @@ describe('Config.vue network config projection', () => {
     expect(input(wrapper, 'input[data-add-label="add_listener_url"]').value).toBe('tcp://0.0.0.0:12010')
     expect(input(wrapper, 'input[data-add-label="add_mapped_listener"]').value).toBe('tcp://127.0.0.1:22000')
 
-    expect(wrapper.find<HTMLSelectElement>('select[data-stub="select-button"]').element.value).toBe('udp')
+    expect(wrapper.find<HTMLSelectElement>(PORT_FORWARD_PROTO_SELECT).element.value).toBe('udp')
     expect(input(wrapper, 'input[placeholder="port_forwards_bind_addr"]').value).toBe('0.0.0.0')
     expect(input(wrapper, 'input[placeholder="port_forwards_dst_addr"]').value).toBe('10.0.0.2')
     expect(wrapper.findComponent(AclManagerStub).props('modelValue')).toStrictEqual(curNetwork.acl)
@@ -457,7 +463,7 @@ describe('Config.vue network config projection', () => {
     await setInput(wrapper, '#socks5_port', '1089')
     await setInput(wrapper, '#exit_nodes', 'exit-edited')
     await setInput(wrapper, 'input[data-add-label="add_mapped_listener"]', 'tcp://127.0.0.1:23000')
-    await wrapper.find('select[data-stub="select-button"]').setValue('tcp')
+    await wrapper.find(PORT_FORWARD_PROTO_SELECT).setValue('tcp')
     await setInput(wrapper, 'input[placeholder="port_forwards_bind_addr"]', '127.0.0.1')
     await setInput(wrapper, 'input[placeholder="port_forwards_dst_addr"]', '10.9.0.2')
 

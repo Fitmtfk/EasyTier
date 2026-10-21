@@ -5,7 +5,9 @@ import InputGroup from 'primevue/inputgroup'
 import InputGroupAddon from 'primevue/inputgroupaddon'
 import {
   addRow,
+  apiCarries,
   DEFAULT_NETWORK_CONFIG,
+  defaultFlagStringValue,
   defaultFlagValue,
   formFlags,
   NetworkConfig,
@@ -147,6 +149,38 @@ function flagChecked(field: keyof NetworkConfig): boolean {
 function setFlag(field: keyof NetworkConfig, value: boolean) {
   Object.assign(curNetwork.value, { [field]: value })
 }
+
+const DIRECT_CONN_FAMILY_FIELD = 'direct_conn_family' as const
+
+/** The states the direct connection family preference offers. */
+const directConnFamilyOptions = [
+  { label: 'auto', value: 'auto' },
+  { label: 'prefer_ipv4', value: 'prefer_ipv4' },
+  { label: 'prefer_ipv6', value: 'prefer_ipv6' },
+]
+
+/**
+ * The state the selector shows: the one the configuration states, or the
+ * default the schema declares when it states none or states one that is not
+ * a state at all.
+ */
+function normalizeDirectConnFamily(value: string | undefined): string {
+  const trimmed = (value ?? '').trim()
+  if (directConnFamilyOptions.some((option) => option.value === trimmed)) {
+    return trimmed
+  }
+
+  const declared = defaultFlagStringValue(DIRECT_CONN_FAMILY_FIELD)
+
+  return directConnFamilyOptions.some((option) => option.value === declared) ? declared : 'auto'
+}
+
+const directConnFamily = computed({
+  get: () => normalizeDirectConnFamily(curNetwork.value.direct_conn_family),
+  set: (value: string) => {
+    curNetwork.value.direct_conn_family = normalizeDirectConnFamily(value)
+  },
+})
 
 const portForwardProtocolOptions = ref(["tcp", "udp"]);
 
@@ -381,6 +415,15 @@ function removeVpnPortalClient(index: number) {
                         @update:model-value="setFlag(flag.field, $event)" />
                       <label :for="flag.field" class="ml-2"> {{ t(flag.field) }} </label>
                       <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t(flag.help)"></span>
+                    </div>
+
+                    <div class="basis-[20rem] flex items-center" v-if="apiCarries(DIRECT_CONN_FAMILY_FIELD)">
+                      <label :for="DIRECT_CONN_FAMILY_FIELD" class="mr-2"> {{ t(DIRECT_CONN_FAMILY_FIELD) }} </label>
+                      <SelectButton :id="DIRECT_CONN_FAMILY_FIELD" v-model="directConnFamily"
+                        :options="directConnFamilyOptions" option-label="label" option-value="value"
+                        :allow-empty="false" />
+                      <span class="pi pi-question-circle ml-2 self-center"
+                        v-tooltip="t(`${DIRECT_CONN_FAMILY_FIELD}_help`)"></span>
                     </div>
 
                   </div>
