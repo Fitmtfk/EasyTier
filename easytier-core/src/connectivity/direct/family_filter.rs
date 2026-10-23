@@ -50,6 +50,10 @@ pub fn listener_matches_prefer_family(listener_url: &str, prefer: ConnFamilyPref
 }
 
 /// 按偏好过滤 listener 列表。
+///
+/// 生产路径已改用 `split_listeners_by_prefer_family`（兜底轮还需要「另一族」列表），
+/// 本函数保留「只要偏好族」的过滤语义与既有测试。
+#[allow(dead_code)]
 pub fn filter_listeners_by_prefer_family<T>(
     listeners: Vec<T>,
     prefer: ConnFamilyPref,
@@ -62,6 +66,44 @@ pub fn filter_listeners_by_prefer_family<T>(
         .into_iter()
         .filter(|listener| listener_matches_prefer_family(url_of(listener), prefer))
         .collect()
+}
+
+/// 按偏好把 listener 列表拆成「偏好族」与「另一族」两份。
+///
+/// - `auto`：全部留在偏好族一侧，另一族恒为空（`auto` 永远不走兜底）。
+/// - `prefer_*`：字面量族 == 偏好族或域名的 listener 归偏好族，
+///   字面量族 != 偏好族的 listener 归另一族（兜底轮用）。
+///
+/// 域名 listener 的族要靠 DNS 解析结果才能确定，因此始终留在偏好族一侧。
+pub fn split_listeners_by_prefer_family<T>(
+    listeners: Vec<T>,
+    prefer: ConnFamilyPref,
+    url_of: impl Fn(&T) -> &str,
+) -> (Vec<T>, Vec<T>) {
+    if prefer == ConnFamilyPref::Auto {
+        // Auto：与上游逐位一致，全部放行，另一族恒空。
+        return (listeners, Vec::new());
+    }
+    let mut preferred = Vec::with_capacity(listeners.len());
+    let mut other = Vec::new();
+    for listener in listeners {
+        if listener_matches_prefer_family(url_of(&listener), prefer) {
+            preferred.push(listener);
+        } else {
+            other.push(listener);
+        }
+    }
+    (preferred, other)
+}
+
+/// 该 peer 是否已有**任意族**的连接。
+///
+/// `Ipv4` / `Ipv6` / `Unknown` 三个族覆盖全部连接（`Unknown` 对应域名连接）。
+/// 用于「偏好族打不通 → 另一族兜底」的门控：已有任何族的连接就不再新建连接。
+pub fn has_any_family_conn(has_conn_of_family: impl Fn(ConnFamily) -> bool) -> bool {
+    [ConnFamily::Ipv4, ConnFamily::Ipv6, ConnFamily::Unknown]
+        .into_iter()
+        .any(has_conn_of_family)
 }
 
 /// 直连时限定解析的地址族。
@@ -341,5 +383,131 @@ mod tests {
             || false,
         );
         assert!(satisfied);
+    }
+
+    #[test]
+    fn has_any_family_conn_covers_all_families() {
+        // 什么族都没连上。
+        assert!(!has_any_family_conn(|_| false));
+        // 只连上 IPv4。
+        assert!(has_any_family_conn(|family| family == ConnFamily::Ipv4));
+        // 只连上 IPv6。
+        assert!(has_any_family_conn(|family| family == ConnFamily::Ipv6));
+        // 只连上域名连接（Unknown）。
+        assert!(has_any_family_conn(|family| family == ConnFamily::Unknown));
+    }
+
+    #[test]
+    fn split_listeners_auto_keeps_all_in_preferred_bucket() {
+        let listeners = vec![
+            "udp://0.0.0.0:11010".to_string(),
+            "udp://[::]:11010".to_string(),
+            "tcp://example.com:11010".to_string(),
+        ];
+        let (preferred, other) =
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::Auto, |l| {
+                l.as_str()
+            });
+        // Auto：全部留在偏好族一侧，另一族恒为空 → 永远不会进兜底 pass。
+        assert_eq!(preferred, listeners);
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn split_listeners_prefer_ipv4_partitions_other_family() {
+        let listeners = vec![
+            "udp://0.0.0.0:11010".to_string(),
+            "udp://[::]:11010".to_string(),
+            "tcp://example.com:11010".to_string(),
+            "tcp://1.2.3.4:11010".to_string(),
+            "tcp://[2001:db8::1]:11010".to_string(),
+        ];
+        let (preferred, other) =
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv4, |l| {
+                l.as_str()
+            });
+        // 字面量族 == 偏好族 / 域名 → 偏好族。
+        assert_eq!(
+            preferred,
+            vec![
+                "udp://0.0.0.0:11010".to_string(),
+                "tcp://example.com:11010".to_string(),
+                "tcp://1.2.3.4:11010".to_string(),
+            ]
+        );
+        // 字面量族 != 偏好族 → 另一族（兜底 pass 用）。
+        assert_eq!(
+            other,
+            vec![
+                "udp://[::]:11010".to_string(),
+                "tcp://[2001:db8::1]:11010".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_listeners_prefer_ipv6_partitions_other_family() {
+        let listeners = vec![
+            "udp://0.0.0.0:11010".to_string(),
+            "udp://[::]:11010".to_string(),
+            "tcp://example.com:11010".to_string(),
+            "tcp://1.2.3.4:11010".to_string(),
+            "tcp://[2001:db8::1]:11010".to_string(),
+        ];
+        let (preferred, other) =
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv6, |l| {
+                l.as_str()
+            });
+        assert_eq!(
+            preferred,
+            vec![
+                "udp://[::]:11010".to_string(),
+                "tcp://example.com:11010".to_string(),
+                "tcp://[2001:db8::1]:11010".to_string(),
+            ]
+        );
+        assert_eq!(
+            other,
+            vec![
+                "udp://0.0.0.0:11010".to_string(),
+                "tcp://1.2.3.4:11010".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_listeners_keeps_unspecified_listener_in_its_own_family() {
+        // `0.0.0.0` 属 V4、`[::]` 属 V6：各自归入自己那一族，
+        // 偏好族的 unspecified 展开源因此被保留。
+        let (preferred, other) = split_listeners_by_prefer_family(
+            vec![
+                "udp://0.0.0.0:11010".to_string(),
+                "udp://[::]:11010".to_string(),
+            ],
+            ConnFamilyPref::PreferIpv4,
+            |l| l.as_str(),
+        );
+        assert_eq!(preferred, vec!["udp://0.0.0.0:11010".to_string()]);
+        assert_eq!(other, vec!["udp://[::]:11010".to_string()]);
+    }
+
+    #[test]
+    fn split_listeners_works_on_proto_url() {
+        let listeners = vec![
+            easytier_proto::common::Url {
+                url: "udp://0.0.0.0:11010".into(),
+            },
+            easytier_proto::common::Url {
+                url: "udp://[::]:11010".into(),
+            },
+        ];
+        let (preferred, other) =
+            split_listeners_by_prefer_family(listeners, ConnFamilyPref::PreferIpv4, |listener| {
+                listener.url.as_str()
+            });
+        assert_eq!(preferred.len(), 1);
+        assert_eq!(preferred[0].url, "udp://0.0.0.0:11010");
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].url, "udp://[::]:11010");
     }
 }

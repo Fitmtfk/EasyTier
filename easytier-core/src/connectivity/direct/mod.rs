@@ -28,8 +28,10 @@ use crate::{
     foundation::task::{PeerTaskLauncher, PeerTaskManager},
     host::dns::DnsResolver,
     peers::{
-        PeerConnectionOrigin, conn::peer_conn::PeerConnId,
-        foreign_network::ForeignNetworkRpcRegistrar, peer_manager::PeerManagerCore,
+        PeerConnectionOrigin,
+        conn::{family::ConnFamilyPref, peer_conn::PeerConnId},
+        foreign_network::ForeignNetworkRpcRegistrar,
+        peer_manager::PeerManagerCore,
         peer_rpc::PeerRpcManager,
     },
     process_runtime::ProtectedTcpPortRegistry,
@@ -118,6 +120,70 @@ impl DirectTransport {
     fn supports_interface_bind(self) -> bool {
         !matches!(self, Self::Tcp(TcpSocketPurpose::FakeTcp))
     }
+}
+
+/// 一轮直连的「满足口径」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DirectSatisfaction {
+    /// 偏好族已连通即算满足（`auto`：已有直连连接即算满足）。
+    Preferred,
+    /// 任意族已连通即算满足（兜底 pass 用）。
+    AnyFamily,
+}
+
+/// 一轮直连的输入：待试的 listener + 满足口径 + 解析时允许的地址族。
+struct DirectConnectPass {
+    listeners: Vec<Url>,
+    satisfaction: DirectSatisfaction,
+    ip_version: IpVersion,
+}
+
+/// 直连的两轮计划。
+struct DirectConnectPlan {
+    /// 第一轮：偏好族（`auto` 下是全部 listener）。
+    preferred: DirectConnectPass,
+    /// 第二轮：另一族兜底（`auto` 下恒为空）。
+    other: DirectConnectPass,
+}
+
+/// 把 listener 列表拆成「偏好族」与「另一族」两轮。
+///
+/// - `auto`：全部 listener 留在第一轮，另一轮恒空 → 永不进兜底（与上游逐位一致）。
+/// - `prefer_*`：域名 listener 留在第一轮（族要靠 DNS 解析才知道），
+///   字面量族 != 偏好族的 listener 进第二轮。
+fn plan_direct_connect(listeners: Vec<Url>, prefer: ConnFamilyPref) -> DirectConnectPlan {
+    let (preferred_listeners, other_listeners) =
+        family_filter::split_listeners_by_prefer_family(listeners, prefer, |listener: &Url| {
+            listener.as_str()
+        });
+
+    DirectConnectPlan {
+        preferred: DirectConnectPass {
+            listeners: preferred_listeners,
+            satisfaction: DirectSatisfaction::Preferred,
+            ip_version: family_filter::prefer_ip_version(prefer),
+        },
+        other: DirectConnectPass {
+            listeners: other_listeners,
+            satisfaction: DirectSatisfaction::AnyFamily,
+            // 兜底轮连的是另一族地址，解析必须放行两族。
+            ip_version: IpVersion::Both,
+        },
+    }
+}
+
+/// 兜底门控：偏好族打不通时，是否允许用另一族 listener 建一条连接。
+///
+/// 三条同时满足才允许：
+/// 1. 偏好不是 `auto`（`auto` 与上游逐位一致，永不兜底）；
+/// 2. 另一族 listener 列表非空；
+/// 3. 该 peer 当前**没有任何族**的连接（已有连接就不重复建连）。
+fn fallback_to_other_family_allowed(
+    prefer: ConnFamilyPref,
+    other_family_listener_count: usize,
+    has_any_family_conn: bool,
+) -> bool {
+    prefer != ConnFamilyPref::Auto && other_family_listener_count > 0 && !has_any_family_conn
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,12 +444,29 @@ where
     /// `has_directly_connected_conn`（它把打洞连接排除在外，会导致
     /// 「打通了还一直重试 + listener 被 300s 拉黑」）。
     fn peer_satisfied(&self, dst_peer_id: PeerId) -> bool {
-        let prefer = self.peer_manager.direct_conn_family();
-        family_filter::peer_satisfied_by(
-            prefer,
-            |family| self.peer_manager.has_conn_of_family(dst_peer_id, family),
-            || self.peer_manager.has_directly_connected_conn(dst_peer_id),
-        )
+        self.peer_satisfied_with(dst_peer_id, DirectSatisfaction::Preferred)
+    }
+
+    /// 直连需求是否已被满足（按本轮的口径判定）。
+    ///
+    /// - `DirectSatisfaction::Preferred`：与现有 `peer_satisfied` 语义一致 ——
+    ///   `auto` 下是「已有直连连接」，`prefer_*` 下是「已有偏好族连接」。
+    /// - `DirectSatisfaction::AnyFamily`：任意族已连通即算满足（兜底轮用），
+    ///   避免兜底轮为同一 peer 连出多条重复连接。
+    fn peer_satisfied_with(&self, dst_peer_id: PeerId, satisfaction: DirectSatisfaction) -> bool {
+        match satisfaction {
+            DirectSatisfaction::Preferred => {
+                let prefer = self.peer_manager.direct_conn_family();
+                family_filter::peer_satisfied_by(
+                    prefer,
+                    |family| self.peer_manager.has_conn_of_family(dst_peer_id, family),
+                    || self.peer_manager.has_directly_connected_conn(dst_peer_id),
+                )
+            }
+            DirectSatisfaction::AnyFamily => family_filter::has_any_family_conn(|family| {
+                self.peer_manager.has_conn_of_family(dst_peer_id, family)
+            }),
+        }
     }
 
     async fn try_direct_connect(self: Arc<Self>, dst_peer_id: PeerId) -> anyhow::Result<()> {
@@ -454,20 +537,58 @@ where
             })
             .collect::<Vec<_>>();
 
-        // 族偏好过滤：只保留偏好族的字面量 listener（域名放行，由 IpVersion 控族）。
+        // 族偏好分区：偏好族进第一轮，另一族进兜底轮（`auto` 下另一轮恒空）。
         // 偏好族自己的 unspecified listener（`0.0.0.0` / `[::]`）因此被保留 ——
         // 它是本族候选地址的唯一展开源。
-        // `auto` 时原样返回，行为与上游逐位一致。
+        // 域名 listener 留在第一轮：它的族要靠 DNS 解析结果才能确定。
         let prefer = self.peer_manager.direct_conn_family();
-        let mut available_listeners = family_filter::filter_listeners_by_prefer_family(
-            available_listeners,
-            prefer,
-            |listener: &Url| listener.as_str(),
-        );
+        let plan = plan_direct_connect(available_listeners, prefer);
 
-        if available_listeners.is_empty() {
+        // 一条 listener 都没有（`auto` 下等价于上游的「无有效 listener」）。
+        if plan.preferred.listeners.is_empty() && plan.other.listeners.is_empty() {
             anyhow::bail!("peer {dst_peer_id} has no valid listener");
         }
+
+        // pass 1：偏好族（`auto` 下即全部 listener）。
+        if self
+            .run_direct_connect_pass(dst_peer_id, &ip_list, plan.preferred)
+            .await
+        {
+            return Ok(());
+        }
+
+        // 兜底门控：偏好族没打通、且该 peer 当前一条连接都没有时，
+        // 允许再用另一族 listener 建一条连接（避免把只提供另一族 listener 的 peer
+        // 变成完全不可直连）。
+        let has_any_family_conn =
+            self.peer_satisfied_with(dst_peer_id, DirectSatisfaction::AnyFamily);
+        if fallback_to_other_family_allowed(prefer, plan.other.listeners.len(), has_any_family_conn)
+        {
+            tracing::info!(
+                ?dst_peer_id,
+                "fallback to other address family for direct connect"
+            );
+            if self
+                .run_direct_connect_pass(dst_peer_id, &ip_list, plan.other)
+                .await
+            {
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 跑一轮直连：按 scheme 排序 → 逐组并发 → 每组结束判满足。
+    ///
+    /// 返回该轮是否已满足（连上了）。
+    async fn run_direct_connect_pass(
+        self: &Arc<Self>,
+        dst_peer_id: PeerId,
+        ip_list: &GetIpListResponse,
+        pass: DirectConnectPass,
+    ) -> bool {
+        let mut available_listeners = pass.listeners;
 
         available_listeners.sort_by_key(|listener| {
             if listener.scheme() == self.options.default_protocol {
@@ -491,15 +612,22 @@ where
                 .is_some_and(|listener| listener.scheme() == current_scheme)
             {
                 let listener = available_listeners.pop().expect("listener should exist");
-                self.spawn_direct_connect_tasks(dst_peer_id, &ip_list, &listener, &mut tasks)
-                    .await;
+                self.spawn_direct_connect_tasks(
+                    dst_peer_id,
+                    ip_list,
+                    &listener,
+                    &mut tasks,
+                    pass.satisfaction,
+                    pass.ip_version,
+                )
+                .await;
             }
             let _ = tasks.join_all().await;
-            if self.peer_satisfied(dst_peer_id) {
-                return Ok(());
+            if self.peer_satisfied_with(dst_peer_id, pass.satisfaction) {
+                return true;
             }
         }
-        Ok(())
+        false
     }
 
     async fn spawn_direct_connect_tasks(
@@ -508,6 +636,8 @@ where
         ip_list: &GetIpListResponse,
         listener: &Url,
         tasks: &mut JoinSet<anyhow::Result<()>>,
+        satisfaction: DirectSatisfaction,
+        ip_version: IpVersion,
     ) {
         let Ok(mut addrs) = resolve_mapped_listener_addrs(
             listener,
@@ -550,6 +680,8 @@ where
                             self.clone(),
                             dst_peer_id,
                             url.to_string(),
+                            satisfaction,
+                            ip_version,
                         ));
                     }
                 }
@@ -562,6 +694,8 @@ where
                     self.clone(),
                     dst_peer_id,
                     listener.to_string(),
+                    satisfaction,
+                    ip_version,
                 ));
             }
             Some(SocketAddr::V6(socket_addr)) if socket_addr.ip().is_unspecified() => {
@@ -587,6 +721,8 @@ where
                             self.clone(),
                             dst_peer_id,
                             url.to_string(),
+                            satisfaction,
+                            ip_version,
                         ));
                     }
                 }
@@ -607,6 +743,8 @@ where
                     self.clone(),
                     dst_peer_id,
                     listener.to_string(),
+                    satisfaction,
+                    ip_version,
                 ));
             }
             _ => {}
@@ -617,6 +755,8 @@ where
         self: Arc<Self>,
         dst_peer_id: PeerId,
         url: String,
+        satisfaction: DirectSatisfaction,
+        ip_version: IpVersion,
     ) -> anyhow::Result<()> {
         self.listener_blacklist.cleanup();
         let key = ListenerBlacklistKey(dst_peer_id, url.clone());
@@ -626,11 +766,13 @@ where
 
         let backoffs_ms = [1000i64, 2000, 4000];
         for attempt in 0..=backoffs_ms.len() {
-            if self.peer_satisfied(dst_peer_id) {
+            if self.peer_satisfied_with(dst_peer_id, satisfaction) {
                 return Ok(());
             }
-            let result = self.connect_to_url_once(dst_peer_id, &url).await;
-            if result.is_ok() || self.peer_satisfied(dst_peer_id) {
+            let result = self
+                .connect_to_url_once(dst_peer_id, &url, satisfaction, ip_version)
+                .await;
+            if result.is_ok() || self.peer_satisfied_with(dst_peer_id, satisfaction) {
                 return Ok(());
             }
             if attempt == backoffs_ms.len() {
@@ -650,7 +792,17 @@ where
         unreachable!("direct URL retry loop must return")
     }
 
-    async fn connect_to_url_once(&self, dst_peer_id: PeerId, raw_url: &str) -> anyhow::Result<()> {
+    async fn connect_to_url_once(
+        &self,
+        dst_peer_id: PeerId,
+        raw_url: &str,
+        satisfaction: DirectSatisfaction,
+        ip_version: IpVersion,
+    ) -> anyhow::Result<()> {
+        if self.peer_satisfied_with(dst_peer_id, satisfaction) {
+            // 本轮口径下已经连上了（或上一轮连上了），不再重复建连。
+            return Ok(());
+        }
         let url = Url::parse(raw_url)?;
         let (peer_id, conn_id) = if url.scheme() == "udp" {
             match url.host() {
@@ -660,14 +812,19 @@ where
                         Ok(result) => result,
                         Err(error) => {
                             tracing::debug!(?error, %url, "public IPv4 UDP punch failed; fallback");
-                            self.connect_ordinary(dst_peer_id, url.clone()).await?
+                            self.connect_ordinary(dst_peer_id, url.clone(), ip_version)
+                                .await?
                         }
                     }
                 }
-                _ => self.connect_ordinary(dst_peer_id, url.clone()).await?,
+                _ => {
+                    self.connect_ordinary(dst_peer_id, url.clone(), ip_version)
+                        .await?
+                }
             }
         } else {
-            self.connect_ordinary(dst_peer_id, url.clone()).await?
+            self.connect_ordinary(dst_peer_id, url.clone(), ip_version)
+                .await?
         };
 
         if peer_id != dst_peer_id && !self.options.testing {
@@ -681,6 +838,7 @@ where
         &self,
         dst_peer_id: PeerId,
         url: Url,
+        ip_version: IpVersion,
     ) -> anyhow::Result<(PeerId, PeerConnId)> {
         let transport = DirectTransport::from_url(&url)?;
         let normalized = convert_idn_to_ascii(url.clone())?;
@@ -692,10 +850,7 @@ where
             self.dns.as_ref(),
             &normalized,
             default_port,
-            self.options.socket_context(
-                transport,
-                family_filter::prefer_ip_version(self.peer_manager.direct_conn_family()),
-            ),
+            self.options.socket_context(transport, ip_version),
         )
         .await?;
         let bind_addrs = if self.options.bind_device
@@ -1302,5 +1457,106 @@ mod tests {
         let set = ExpiringSet::default();
         set.insert(7u32, Duration::ZERO);
         assert!(!set.contains(&7));
+    }
+
+    fn ipv6_listener_url() -> Url {
+        Url::parse("tcp://[2001:db8::1]:11010").unwrap()
+    }
+
+    #[test]
+    fn falls_back_to_other_family_when_preferred_family_has_no_listener() {
+        // 偏好 IPv4，但对端只提供 IPv6 listener。
+        let listeners = vec![ipv6_listener_url()];
+        let plan = plan_direct_connect(listeners, ConnFamilyPref::PreferIpv4);
+
+        // 第一轮（偏好族）没有可试的 listener。
+        assert!(plan.preferred.listeners.is_empty());
+        assert_eq!(plan.preferred.satisfaction, DirectSatisfaction::Preferred);
+        assert_eq!(plan.preferred.ip_version, IpVersion::V4);
+
+        // 兜底轮用另一族的 listener：任意族连通即算满足，socket 解析放行两族。
+        assert_eq!(plan.other.listeners.len(), 1);
+        assert_eq!(
+            plan.other.listeners[0].as_str(),
+            "tcp://[2001:db8::1]:11010"
+        );
+        assert_eq!(plan.other.satisfaction, DirectSatisfaction::AnyFamily);
+        assert_eq!(plan.other.ip_version, IpVersion::Both);
+
+        // 门控：偏好非 auto、另一族非空、该 peer 还没有任何族的连接。
+        assert!(fallback_to_other_family_allowed(
+            ConnFamilyPref::PreferIpv4,
+            plan.other.listeners.len(),
+            false
+        ));
+    }
+
+    #[test]
+    fn does_not_fall_back_when_peer_already_has_a_connection() {
+        let listeners = vec![ipv6_listener_url()];
+        let plan = plan_direct_connect(listeners, ConnFamilyPref::PreferIpv4);
+        // 该 peer 已经有一条连接（任何族）→ 不再新建重复连接。
+        assert!(!fallback_to_other_family_allowed(
+            ConnFamilyPref::PreferIpv4,
+            plan.other.listeners.len(),
+            true
+        ));
+    }
+
+    #[test]
+    fn does_not_fall_back_when_other_family_has_no_listener() {
+        // 偏好 IPv4，但只提供 IPv4 listener → 没有兜底目标。
+        let listeners = vec![Url::parse("tcp://1.2.3.4:11010").unwrap()];
+        let plan = plan_direct_connect(listeners, ConnFamilyPref::PreferIpv4);
+        assert_eq!(plan.preferred.listeners.len(), 1);
+        assert!(plan.other.listeners.is_empty());
+        assert!(!fallback_to_other_family_allowed(
+            ConnFamilyPref::PreferIpv4,
+            plan.other.listeners.len(),
+            false
+        ));
+    }
+
+    #[test]
+    fn auto_never_falls_back_to_other_family() {
+        let listeners = vec![
+            Url::parse("udp://0.0.0.0:11010").unwrap(),
+            Url::parse("udp://[::]:11010").unwrap(),
+            Url::parse("tcp://example.com:11010").unwrap(),
+        ];
+        let plan = plan_direct_connect(listeners, ConnFamilyPref::Auto);
+
+        // Auto：全部 listener 留在第一轮，另一轮恒为空 → 永远不会兜底。
+        assert_eq!(plan.preferred.listeners.len(), 3);
+        assert!(plan.other.listeners.is_empty());
+        assert!(!fallback_to_other_family_allowed(
+            ConnFamilyPref::Auto,
+            plan.other.listeners.len(),
+            false
+        ));
+
+        // Auto 的第一轮与上游逐位一致：解析放行两族、「已有直连连接」即算满足。
+        assert_eq!(plan.preferred.satisfaction, DirectSatisfaction::Preferred);
+        assert_eq!(plan.preferred.ip_version, IpVersion::Both);
+    }
+
+    #[test]
+    fn fallback_pass_excludes_domain_listeners() {
+        // 域名的族要靠 DNS 解析结果决定，无法按轮次区分 → 留在第一轮，不进兜底轮。
+        let listeners = vec![
+            Url::parse("tcp://example.com:11010").unwrap(),
+            ipv6_listener_url(),
+        ];
+        let plan = plan_direct_connect(listeners, ConnFamilyPref::PreferIpv4);
+        assert_eq!(plan.preferred.listeners.len(), 1);
+        assert_eq!(
+            plan.preferred.listeners[0].as_str(),
+            "tcp://example.com:11010"
+        );
+        assert_eq!(plan.other.listeners.len(), 1);
+        assert_eq!(
+            plan.other.listeners[0].as_str(),
+            "tcp://[2001:db8::1]:11010"
+        );
     }
 }
