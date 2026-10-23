@@ -35,6 +35,7 @@ pub(crate) const FAMILY_CONNECT_MAX_WINDOWS: u32 = 5;
 ///
 /// 记录「从最近一次成功/重置以来」的窗口数、窗口内已耗轮数与冷却截止时刻。
 ///冷却开始前已完成轮数仍计入 `rounds`，直到冷却结束时才清零进入下一窗口。
+#[derive(Default)]
 pub(crate) struct FamilyBudgetState {
     /// 已耗掉的窗口数（跨冷却累计）。
     pub(crate) windows: u32,
@@ -48,19 +49,6 @@ pub(crate) struct FamilyBudgetState {
     pub(crate) conn_snapshot: Option<usize>,
     /// 耗尽时刻记录的偏好设置快照（恢复判定用）。
     pub(crate) prefer_snapshot: Option<ConnFamilyPref>,
-}
-
-impl Default for FamilyBudgetState {
-    fn default() -> Self {
-        Self {
-            windows: 0,
-            rounds: 0,
-            cooldown_until: None,
-            exhausted: false,
-            conn_snapshot: None,
-            prefer_snapshot: None,
-        }
-    }
 }
 
 impl FamilyBudgetState {

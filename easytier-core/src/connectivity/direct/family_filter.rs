@@ -49,19 +49,8 @@ pub fn listener_matches_prefer_family(listener_url: &str, prefer: ConnFamilyPref
     }
 }
 
-/// 按偏好过滤 listener 列表，只保留偏好族一侧。
-///
-/// 「只要偏好族」= `split_listeners_by_prefer_family` 取偏好族侧（`.0`），
-/// 两处语义由同一个判定函数保证；生产路径用的拆分版本见下方同名 split 函数。
-pub fn filter_listeners_by_prefer_family<T>(
-    listeners: Vec<T>,
-    prefer: ConnFamilyPref,
-    url_of: impl Fn(&T) -> &str,
-) -> Vec<T> {
-    split_listeners_by_prefer_family(listeners, prefer, url_of).0
-}
-
 /// 按偏好把 listener 列表拆成「偏好族」与「另一族」两份。
+/// 「只要偏好族」= 取返回值偏好族侧（`.0`）。
 ///
 /// - `auto`：全部留在偏好族一侧，另一族恒为空（`auto` 永远不走兜底）。
 /// - `prefer_*`：字面量族 == 偏好族或域名的 listener 归偏好族，
@@ -234,9 +223,10 @@ mod tests {
             "tcp://example.com:11010".to_string(),
         ];
         let filtered =
-            filter_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::Auto, |l| {
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::Auto, |l| {
                 l.as_str()
-            });
+            })
+            .0;
         assert_eq!(filtered, listeners);
     }
 
@@ -249,9 +239,10 @@ mod tests {
             "tcp://1.2.3.4:11010".to_string(),
         ];
         let filtered =
-            filter_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv4, |l| {
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv4, |l| {
                 l.as_str()
-            });
+            })
+            .0;
         assert_eq!(
             filtered,
             vec![
@@ -262,9 +253,10 @@ mod tests {
         );
 
         let filtered =
-            filter_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv6, |l| {
+            split_listeners_by_prefer_family(listeners.clone(), ConnFamilyPref::PreferIpv6, |l| {
                 l.as_str()
-            });
+            })
+            .0;
         assert_eq!(
             filtered,
             vec![
@@ -285,9 +277,10 @@ mod tests {
             },
         ];
         let filtered =
-            filter_listeners_by_prefer_family(listeners, ConnFamilyPref::PreferIpv4, |listener| {
+            split_listeners_by_prefer_family(listeners, ConnFamilyPref::PreferIpv4, |listener| {
                 listener.url.as_str()
-            });
+            })
+            .0;
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].url, "udp://0.0.0.0:11010");
     }

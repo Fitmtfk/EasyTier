@@ -9,11 +9,7 @@ use quanta::Instant;
 use crate::{
     config::{P2pPolicyFlags, PeerId},
     foundation::task::ExternalTaskSignal,
-    peers::{
-        PeerConnectionOrigin,
-        conn::family::{ConnFamily, ConnFamilyPref},
-        peer_manager::PeerManagerCore,
-    },
+    peers::{PeerConnectionOrigin, conn::family::ConnFamilyPref, peer_manager::PeerManagerCore},
     proto::{
         common::NatType,
         peer_rpc::{
@@ -113,9 +109,9 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
                     udp_nat_type,
                     feature_flag: route.feature_flag,
                     has_direct_connection: has_satisfied_punch_condition(
-                        &has_conn,
-                        &has_any,
-                        &has_punched,
+                        has_conn,
+                        has_any,
+                        has_punched,
                         route.peer_id,
                         prefer,
                         true, // UDP 对称打洞只能产出 IPv4 路径
@@ -226,9 +222,9 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
                     .unwrap_or(NatType::Unknown),
                 feature_flag: route.feature_flag,
                 has_direct_connection: has_satisfied_punch_condition(
-                    &has_conn,
-                    &has_any,
-                    &has_punched,
+                    has_conn,
+                    has_any,
+                    has_punched,
                     route.peer_id,
                     prefer,
                     false, // TCP 对称打洞两族都支持
