@@ -747,19 +747,34 @@ mod tests {
     #[test]
     fn preferred_family_ranks_before_unknown_and_other_family() {
         let v4 = ConnFamilyPref::PreferIpv4;
-        assert!(conn_sort_key(20_000, false, ConnFamily::Ipv4, v4) < conn_sort_key(0, false, ConnFamily::Unknown, v4));
-        assert!(conn_sort_key(0, false, ConnFamily::Unknown, v4) < conn_sort_key(0, false, ConnFamily::Ipv6, v4));
+        assert!(
+            conn_sort_key(20_000, false, ConnFamily::Ipv4, v4)
+                < conn_sort_key(0, false, ConnFamily::Unknown, v4)
+        );
+        assert!(
+            conn_sort_key(0, false, ConnFamily::Unknown, v4)
+                < conn_sort_key(0, false, ConnFamily::Ipv6, v4)
+        );
 
         let v6 = ConnFamilyPref::PreferIpv6;
-        assert!(conn_sort_key(20_000, false, ConnFamily::Ipv6, v6) < conn_sort_key(0, false, ConnFamily::Unknown, v6));
-        assert!(conn_sort_key(0, false, ConnFamily::Unknown, v6) < conn_sort_key(0, false, ConnFamily::Ipv4, v6));
+        assert!(
+            conn_sort_key(20_000, false, ConnFamily::Ipv6, v6)
+                < conn_sort_key(0, false, ConnFamily::Unknown, v6)
+        );
+        assert!(
+            conn_sort_key(0, false, ConnFamily::Unknown, v6)
+                < conn_sort_key(0, false, ConnFamily::Ipv4, v6)
+        );
     }
 
     #[test]
     fn unconfirmed_hole_punch_still_goes_last() {
         let v4 = ConnFamilyPref::PreferIpv4;
         // 刚打洞进来、首个 ping 未确认的连接，即使族匹配也不抢流量
-        assert!(conn_sort_key(0, true, ConnFamily::Ipv4, v4) > conn_sort_key(20_000, false, ConnFamily::Ipv6, v4));
+        assert!(
+            conn_sort_key(0, true, ConnFamily::Ipv4, v4)
+                > conn_sort_key(20_000, false, ConnFamily::Ipv6, v4)
+        );
     }
 
     #[tokio::test]
@@ -770,9 +785,21 @@ mod tests {
 
         // 三条连接：延迟都是 0、都不是打洞 → 上游键全部并列，
         // min_by_key 取「首个」最小值，并列时保持先出现者。
-        let v4 = conn_with_remote_addr(&context, "tcp://1.2.3.4:11010", PeerConnectionOrigin::Direct);
-        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
-        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        let v4 = conn_with_remote_addr(
+            &context,
+            "tcp://1.2.3.4:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let v6 = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let unknown = conn_with_remote_addr(
+            &context,
+            "tcp://example.com:11010",
+            PeerConnectionOrigin::Direct,
+        );
         peer.conns.insert(v4.get_conn_id(), Arc::new(v4));
         peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
         peer.conns.insert(unknown.get_conn_id(), Arc::new(unknown));
@@ -804,7 +831,10 @@ mod tests {
                 )
             })
             .map(|conn| conn.value().get_conn_id());
-        assert_eq!(upstream_pick, new_pick, "auto 下新键必须与上游选出同一个连接");
+        assert_eq!(
+            upstream_pick, new_pick,
+            "auto 下新键必须与上游选出同一个连接"
+        );
 
         // select_conn 实际选中的也必须与上游一致。
         assert_eq!(
@@ -826,9 +856,21 @@ mod tests {
 
         // 三条连接延迟都是 0、都不是打洞 → 上游只会按迭代顺序取首个；
         // prefer_ipv4 下只有 v4 的族分量是 0，必须选 v4。
-        let v4 = conn_with_remote_addr(&context, "tcp://1.2.3.4:11010", PeerConnectionOrigin::Direct);
-        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
-        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        let v4 = conn_with_remote_addr(
+            &context,
+            "tcp://1.2.3.4:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let v6 = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let unknown = conn_with_remote_addr(
+            &context,
+            "tcp://example.com:11010",
+            PeerConnectionOrigin::Direct,
+        );
         let v4_id = v4.get_conn_id();
         peer.conns.insert(v4.get_conn_id(), Arc::new(v4));
         peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
@@ -847,8 +889,16 @@ mod tests {
         let peer = Peer::new(2, packet_recv_chan, context.clone());
 
         // 没有 v4 连接：Unknown（族分量 1）必须胜过另一族（族分量 2）。
-        let v6 = conn_with_remote_addr(&context, "tcp://[2001:db8::1]:11010", PeerConnectionOrigin::Direct);
-        let unknown = conn_with_remote_addr(&context, "tcp://example.com:11010", PeerConnectionOrigin::Direct);
+        let v6 = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let unknown = conn_with_remote_addr(
+            &context,
+            "tcp://example.com:11010",
+            PeerConnectionOrigin::Direct,
+        );
         let unknown_id = unknown.get_conn_id();
         peer.conns.insert(v6.get_conn_id(), Arc::new(v6));
         peer.conns.insert(unknown.get_conn_id(), Arc::new(unknown));
