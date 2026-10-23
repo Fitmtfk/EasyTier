@@ -84,4 +84,7 @@ direct_conn_family = "prefer_ipv4"
 - **打洞产出的连接族不可控**：TCP 对称打洞连的是对端的**映射地址**，族由对端 NAT 决定，
   本地无法指定；UDP 对称打洞固定产出 **IPv4** 路径。
   因此 `prefer_ipv6` + TCP 打洞可能打不出 IPv6 路径（UDP 打洞同）。
+- **对端主动打进来的连接也算数**：打洞是双向的，对端通过 server-side punch
+  打过来的连接（同属 punch 来源）也计入收敛——本端相应传输会因此
+  **停止重复发起**打洞，符合 spec §10.2 的既定语义，不是 bug。
 - 域名形式的对端 listener（`tcp://example.com:11010`）在偏好模式下只解析偏好族。

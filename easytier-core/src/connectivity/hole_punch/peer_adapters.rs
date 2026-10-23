@@ -44,6 +44,11 @@ use super::{
 /// - `has_conn`：该 peer 是否已有**偏好族**的连接（含打洞得到的连接）。
 /// - `has_any`：该 peer 是否已有**任意**连接（上游 `has_peer` 语义）。
 /// - `has_punched`：该 peer 是否已有**本传输**打洞来源的连接（未关闭）。
+///
+/// server-side punch tunnel（对端打洞打过来的连接，`tcp.rs` / `udp/runtime.rs`
+/// 的 `add_server_transport` 路径）同属 punch origin，**计入收敛**：
+/// 对端打过来的连接同样让本端该传输停止重复发起——这是 spec §10.2
+/// 的既定语义，不是 bug。
 pub(crate) fn has_satisfied_punch_condition(
     has_conn: impl Fn(PeerId) -> bool,
     has_any: impl Fn(PeerId) -> bool,
@@ -86,6 +91,9 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
             None => false,
         };
         let has_any = |id: PeerId| peer_map.has_peer(id);
+        // UDP 打洞连接恒为 IPv4 族（udp/runtime.rs 固定 IpVersion::V4），
+        // prefer_ipv4 下 has_conn 必先为真；此处 has_punched 只是 Unknown 族
+        // （打洞产出未知族连接）的边角兜底。
         let has_punched =
             |id: PeerId| peer_map.has_conn_with_origin(id, PeerConnectionOrigin::UdpHolePunch);
         self.list_route_snapshots()

@@ -49,23 +49,16 @@ pub fn listener_matches_prefer_family(listener_url: &str, prefer: ConnFamilyPref
     }
 }
 
-/// 按偏好过滤 listener 列表。
+/// 按偏好过滤 listener 列表，只保留偏好族一侧。
 ///
-/// 生产路径已改用 `split_listeners_by_prefer_family`（兜底轮还需要「另一族」列表），
-/// 本函数保留「只要偏好族」的过滤语义与既有测试。
-#[allow(dead_code)]
+/// 「只要偏好族」= `split_listeners_by_prefer_family` 取偏好族侧（`.0`），
+/// 两处语义由同一个判定函数保证；生产路径用的拆分版本见下方同名 split 函数。
 pub fn filter_listeners_by_prefer_family<T>(
     listeners: Vec<T>,
     prefer: ConnFamilyPref,
     url_of: impl Fn(&T) -> &str,
 ) -> Vec<T> {
-    if prefer == ConnFamilyPref::Auto {
-        return listeners;
-    }
-    listeners
-        .into_iter()
-        .filter(|listener| listener_matches_prefer_family(url_of(listener), prefer))
-        .collect()
+    split_listeners_by_prefer_family(listeners, prefer, url_of).0
 }
 
 /// 按偏好把 listener 列表拆成「偏好族」与「另一族」两份。

@@ -32,8 +32,10 @@ fn conn_latency_sort_key(latency_us: u64, is_hole_punched: bool) -> (bool, u64) 
     (is_hole_punched && latency_us == 0, latency_us)
 }
 
-/// 直连族偏好缓存的刷新周期：运行期改 `direct_conn_family` 后最多 5 秒生效（无需重启实例）。
-const PREFER_FAMILY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Peer 周期维护任务的唯一周期（当前 5 秒），这一轮循环顺带做两件事：
+/// ① default_conn 连接数 > 1 时清空缓存；② 刷新直连族偏好缓存
+/// （运行期改 `direct_conn_family` 后最多一个周期生效，无需重启实例）。
+const PEER_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 连接排序键：分量顺序不可调换。
 /// 1. 刚打洞进来、首个 ping 未确认的连接排最后（上游语义）。
@@ -66,15 +68,14 @@ pub struct Peer {
     default_conn_update_lock: Arc<Mutex<()>>,
     peer_identity_type: Arc<AtomicCell<Option<PeerIdentityType>>>,
     peer_public_key: Arc<RwLock<Option<Vec<u8>>>>,
+    /// Peer 周期 5 秒维护任务（清 default_conn 缓存 + 刷新族偏好缓存）的句柄；
+    /// 存进 Peer，随 Peer drop 而 abort，不能丢。
     #[allow(dead_code)]
     default_conn_clear_task: AbortOnDropHandle<()>,
 
-    /// 直连族偏好缓存；每 5 秒刷新一次（见 prefer_family_refresh_task）。
-    /// 运行期改 `direct_conn_family` 后最多 5 秒生效，不需要重启实例。
+    /// 直连族偏好缓存；每 5 秒在 Peer 的维护任务（default_conn_clear_task）里刷新。
+    /// 运行期改 `direct_conn_family` 后最多一个周期生效，不需要重启实例。
     prefer_family: Arc<ArcSwap<ConnFamilyPref>>,
-    /// 偏好缓存刷新任务句柄；存进 Peer，随 Peer drop 而 abort，不能丢。
-    #[allow(dead_code)]
-    prefer_family_refresh_task: AbortOnDropHandle<()>,
 }
 
 impl Peer {
@@ -156,28 +157,27 @@ impl Peer {
 
         let conns_copy = conns.clone();
         let default_conn_copy = default_conn.clone();
-        let default_conn_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
-            loop {
-                crate::foundation::time::sleep(std::time::Duration::from_secs(5)).await;
-                if conns_copy.len() > 1 {
-                    default_conn_copy.store(None);
-                }
-            }
-        }));
 
-        // 直连族偏好：初始值取当前旗标，之后每 5 秒刷新一次，
-        // 运行期改开关最多 5 秒生效（不需要重启实例）。
+        // 直连族偏好：初始值取当前旗标，之后每 5 秒在下面的维护任务里刷新，
+        // 运行期改开关最多一个周期生效（不需要重启实例）。
         let prefer_family = Arc::new(ArcSwap::from_pointee(ConnFamilyPref::from_flag_str(
             &context.flags().direct_conn_family,
         )));
         let prefer_family_copy = prefer_family.clone();
         let prefer_context_copy = context.clone();
-        let prefer_family_refresh_task = AbortOnDropHandle::new(tokio::spawn(async move {
+
+        // Peer 周期 5 秒的维护任务（本 Peer 唯一的定时任务，循环里顺带做两件事）：
+        // ① default_conn 连接数 > 1 时清空缓存、强制重选（上游语义）；
+        // ② 刷新直连族偏好缓存。
+        // 句柄存进 Peer，随 Peer drop 而 abort（drop-abort 行为与拆分前一致）。
+        let default_conn_clear_task = AbortOnDropHandle::new(tokio::spawn(async move {
             loop {
-                crate::foundation::time::sleep(PREFER_FAMILY_REFRESH_INTERVAL).await;
-                let pref = ConnFamilyPref::from_flag_str(
-                    &prefer_context_copy.flags().direct_conn_family,
-                );
+                crate::foundation::time::sleep(PEER_MAINTENANCE_INTERVAL).await;
+                if conns_copy.len() > 1 {
+                    default_conn_copy.store(None);
+                }
+                let pref =
+                    ConnFamilyPref::from_flag_str(&prefer_context_copy.flags().direct_conn_family);
                 prefer_family_copy.store(Arc::new(pref));
             }
         }));
@@ -198,7 +198,6 @@ impl Peer {
             peer_public_key,
             default_conn_clear_task,
             prefer_family,
-            prefer_family_refresh_task,
         }
     }
 
@@ -298,11 +297,6 @@ impl Peer {
             self.default_conn.store(Some(conn.clone()));
         }
         selected
-    }
-
-    /// 当前生效的直连族偏好（5 秒缓存；运行期改开关最多 5 秒内生效）。
-    pub(crate) fn prefer_family(&self) -> ConnFamilyPref {
-        *self.prefer_family.load_full()
     }
 
     pub async fn send_msg(&self, msg: ZCPacket) -> Result<(), Error> {
@@ -555,6 +549,32 @@ mod tests {
         peer.conns.remove(&direct_conn_id);
     }
 
+    /// 评审（T5）补充的孤立负向断言：只有 Direct 来源连接的 peer，
+    /// 任何打洞来源的 `has_conn_with_origin` 都必须为 false——
+    /// 否则打洞层「本传输已尽力」的判断会被直连连接误触发。
+    #[tokio::test]
+    async fn direct_only_peer_has_no_punch_origin_conns() {
+        let context: ArcPeerContext = Arc::new(NoopPeerContext::default());
+        let direct = conn_with_remote_addr(
+            &context,
+            "tcp://1.2.3.4:11010",
+            PeerConnectionOrigin::Direct,
+        );
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context);
+        let direct_conn_id = direct.get_conn_id();
+        peer.conns.insert(direct_conn_id, Arc::new(direct));
+
+        assert!(peer.has_conn_with_origin(PeerConnectionOrigin::Direct));
+        assert!(!peer.has_conn_with_origin(PeerConnectionOrigin::TcpHolePunch));
+        assert!(!peer.has_conn_with_origin(PeerConnectionOrigin::UdpHolePunch));
+
+        // 未握手的连接没有 info，get_conn_info() 会 panic（上游既有行为），
+        // 因此先摘掉连接再让 Peer 析构。
+        peer.conns.remove(&direct_conn_id);
+    }
+
     #[test]
     fn family_predicate_excludes_closed_and_unknown() {
         assert!(conn_counts_as_family(
@@ -802,7 +822,7 @@ mod tests {
         let context = context_with_prefer("prefer_ipv4");
         let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
         let peer = Peer::new(2, packet_recv_chan, context.clone());
-        assert_eq!(peer.prefer_family(), ConnFamilyPref::PreferIpv4);
+        assert_eq!(*peer.prefer_family.load_full(), ConnFamilyPref::PreferIpv4);
 
         // 三条连接延迟都是 0、都不是打洞 → 上游只会按迭代顺序取首个；
         // prefer_ipv4 下只有 v4 的族分量是 0，必须选 v4。
@@ -848,7 +868,7 @@ mod tests {
         });
         let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
         let peer = Peer::new(2, packet_recv_chan, context.clone());
-        assert_eq!(peer.prefer_family(), ConnFamilyPref::Auto);
+        assert_eq!(*peer.prefer_family.load_full(), ConnFamilyPref::Auto);
 
         // 运行期改开关：最多 5 秒内生效，不需要重启实例。
         let mut new_flags = flags.load_full().as_ref().clone();
@@ -856,11 +876,11 @@ mod tests {
         flags.store(Arc::new(new_flags));
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-        while peer.prefer_family() != ConnFamilyPref::PreferIpv4 {
+        while *peer.prefer_family.load_full() != ConnFamilyPref::PreferIpv4 {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "prefer family cache should refresh within 5s, got {:?}",
-                peer.prefer_family()
+                *peer.prefer_family.load_full()
             );
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
