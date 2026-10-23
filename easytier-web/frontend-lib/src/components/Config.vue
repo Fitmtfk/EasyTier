@@ -417,16 +417,20 @@ function removeVpnPortalClient(index: number) {
                       <span class="pi pi-question-circle ml-2 self-center" v-tooltip="t(flag.help)"></span>
                     </div>
 
-                    <div class="basis-[20rem] flex items-center" v-if="apiCarries(DIRECT_CONN_FAMILY_FIELD)">
-                      <label :for="DIRECT_CONN_FAMILY_FIELD" class="mr-2"> {{ t(DIRECT_CONN_FAMILY_FIELD) }} </label>
-                      <SelectButton :id="DIRECT_CONN_FAMILY_FIELD" v-model="directConnFamily"
-                        :options="directConnFamilyOptions" option-label="label" option-value="value"
-                        :allow-empty="false" />
-                      <span class="pi pi-question-circle ml-2 self-center"
-                        v-tooltip="t(`${DIRECT_CONN_FAMILY_FIELD}_help`)"></span>
-                    </div>
-
                   </div>
+                </div>
+              </div>
+
+              <div class="flex flex-row gap-x-9 flex-wrap" v-if="apiCarries(DIRECT_CONN_FAMILY_FIELD)">
+                <div class="flex flex-col gap-2">
+                  <div class="flex">
+                    <label :for="DIRECT_CONN_FAMILY_FIELD"> {{ t(DIRECT_CONN_FAMILY_FIELD) }} </label>
+                    <span class="pi pi-question-circle ml-2 self-center"
+                      v-tooltip="t(`${DIRECT_CONN_FAMILY_FIELD}_help`)"></span>
+                  </div>
+                  <SelectButton :id="DIRECT_CONN_FAMILY_FIELD" v-model="directConnFamily"
+                    :options="directConnFamilyOptions" option-label="label" option-value="value"
+                    :allow-empty="false" />
                 </div>
               </div>
 
