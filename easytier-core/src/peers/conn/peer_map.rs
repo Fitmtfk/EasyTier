@@ -491,3 +491,68 @@ pub(crate) async fn direct_peer_info(peer_maps: &[Arc<PeerMap>]) -> PeerInfoForG
     }
     ret
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::*;
+    use crate::peers::{
+        conn::peer_session::PeerSessionStore, create_packet_recv_chan,
+        test_support::NoopPeerContext,
+    };
+    use crate::tunnel::ring::create_ring_tunnel_pair;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn has_conn_of_family_is_false_for_unknown_peer() {
+        let (packet_send, _packet_recv) = create_packet_recv_chan();
+        let peer_map = PeerMap::new(packet_send, Arc::new(NoopPeerContext::default()), 1);
+
+        // 不在本地 map 里的 peer 查任何族都必须是 false，不能 panic。
+        assert!(!peer_map.has_conn_of_family(2, ConnFamily::Ipv4));
+        assert!(!peer_map.has_conn_of_family(2, ConnFamily::Unknown));
+    }
+
+    #[tokio::test]
+    async fn has_conn_of_family_tracks_live_and_removes_closed_conns() {
+        let session_store = Arc::new(PeerSessionStore::new());
+        let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+        let client_ctx = Arc::new(NoopPeerContext::default());
+        let server_ctx = Arc::new(NoopPeerContext::default());
+
+        let mut client_conn =
+            PeerConn::new(1, client_ctx.clone(), client_tunnel, session_store.clone());
+        let conn_id = client_conn.get_conn_id();
+        let mut server_conn = PeerConn::new(2, server_ctx.clone(), server_tunnel, session_store);
+        let (client_ret, server_ret) = tokio::join!(
+            client_conn.do_handshake_as_client(),
+            server_conn.do_handshake_as_server_ext(|_, _| Ok(()))
+        );
+        client_ret.unwrap();
+        server_ret.unwrap();
+
+        let (client_tx, _client_rx) = create_packet_recv_chan();
+        let (server_tx, _server_rx) = create_packet_recv_chan();
+        let client_map = PeerMap::new(client_tx, client_ctx, 1);
+        // server map 只用来消化握手，不参与断言。
+        let _server_map = PeerMap::new(server_tx, server_ctx, 2);
+
+        client_map.add_new_peer_conn(client_conn).await.unwrap();
+
+        // ring 隧道的对端地址没有 IP（ring://uuid）→ 族 Unknown。
+        assert!(client_map.has_conn_of_family(2, ConnFamily::Unknown));
+        assert!(!client_map.has_conn_of_family(2, ConnFamily::Ipv4));
+        assert!(!client_map.has_conn_of_family(2, ConnFamily::Ipv6));
+
+        // 关闭后连接被摘除，查询回落 false（关闭是异步的，等它生效）。
+        client_map.close_peer_conn(2, &conn_id).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while client_map.has_conn_of_family(2, ConnFamily::Unknown) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed conn should stop matching the family query");
+    }
+}

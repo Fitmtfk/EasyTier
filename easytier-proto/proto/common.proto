@@ -90,13 +90,27 @@ message Flags {
   // advertising another direct edge to the same destination.
   bool prefer_peer_relay = 44 [(easytier.flag) = { default: "false" }];
 
-  // Which address family a direct connection should prefer. "auto" keeps the
-  // upstream behaviour: the candidate addresses are tried in latency order and
-  // the first one that completes the handshake is used. "prefer_ipv4" and
-  // "prefer_ipv6" only reorder that list and keep the other family as a
-  // fallback, so a preference never prevents a direct connection. An empty or
-  // unknown value is handled as "auto" instead of disabling direct
-  // connections.
+  // Address-family preference for direct connections. "auto" (the default)
+  // keeps the upstream behaviour: no family filtering, no family ordering and
+  // no attempt caps, and any completed direct connection satisfies the need.
+  //
+  // "prefer_ipv4" / "prefer_ipv6" carry direct connections and traffic on the
+  // preferred family where possible: listeners of the other literal family
+  // are filtered out, and domain listeners still resolve but under an
+  // IP-version limit pinned to the preferred family, so the preference picks
+  // which family the candidates may need, not merely the attempt order. A
+  // live connection of the preferred family (hole-punched ones included) is
+  // what satisfies the preference: an other-family connection keeps the peer
+  // reachable but never cancels the preferred-family attempts.
+  //
+  // Only when those attempts keep failing AND the peer has no connection of
+  // any family yet is a single fallback connection built from the other
+  // family's listeners (no IP-version limit) so the peer stays reachable; the
+  // fallback never duplicates an existing connection. Retries converge via
+  // the direct connector's backoff budget and blacklist, so an unreachable
+  // family neither loops forever nor blocks a peer that is only reachable
+  // the other way. The value is stored verbatim; an empty or unknown value
+  // falls back to "auto" where it is consumed.
   string direct_conn_family = 45 [(easytier.flag) = { default: "auto", form: true }];
 }
 

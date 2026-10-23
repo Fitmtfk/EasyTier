@@ -1255,6 +1255,41 @@ direct_conn_family = "prefer_ipv4"
         assert_eq!(restored.get_flags().direct_conn_family, "prefer_ipv4");
     }
 
+    // The config layer stores `direct_conn_family` verbatim: it neither
+    // validates nor rewrites the value. Unknown values only fall back to
+    // "auto" where the flag is consumed (ConnFamilyPref::from_flag_str), so
+    // dumping and re-loading the config must not lose the original user
+    // value either.
+    #[cfg(feature = "config-write")]
+    #[test]
+    fn toml_round_trip_keeps_unknown_direct_conn_family_verbatim() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[flags]
+direct_conn_family = "bogus"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.get_flags().direct_conn_family, "bogus");
+
+        let restored = TomlConfig::new_from_str(&config.dump()).unwrap();
+        assert_eq!(restored.get_flags().direct_conn_family, "bogus");
+    }
+
+    #[test]
+    fn toml_keeps_direct_conn_family_whitespace_verbatim() {
+        let config = TomlConfig::new_from_str(
+            r#"
+[flags]
+direct_conn_family = " prefer_ipv4 "
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.get_flags().direct_conn_family, " prefer_ipv4 ");
+    }
+
     #[test]
     fn direct_conn_family_defaults_to_auto_when_unset() {
         let config = TomlConfig::new_from_str("").unwrap();

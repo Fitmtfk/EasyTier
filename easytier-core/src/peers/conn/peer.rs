@@ -438,7 +438,7 @@ mod tests {
     use crate::peers::test_support::NoopPeerContext;
     use crate::peers::{PeerConnectionOrigin, create_packet_recv_chan};
     use crate::proto::common::TunnelInfo;
-    use crate::tunnel::ring::{RingTunnel, create_ring_socket_pair};
+    use crate::tunnel::ring::{RingTunnel, create_ring_socket_pair, create_ring_tunnel_pair};
 
     fn tunnel_with_remote_addr(remote_addr: &str) -> Box<dyn crate::tunnel::Tunnel> {
         let (socket, _peer_socket) = create_ring_socket_pair(16);
@@ -577,6 +577,118 @@ mod tests {
             false,
             ConnFamily::Ipv6
         ));
+    }
+
+    // ---- has_conn_of_family（Peer 级行为）----
+
+    #[tokio::test]
+    async fn has_conn_of_family_counts_tcp_and_udp_hole_punched_conns() {
+        let context: ArcPeerContext = Arc::new(NoopPeerContext::default());
+        let tcp_punched = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::TcpHolePunch,
+        );
+        let udp_punched = conn_with_remote_addr(
+            &context,
+            "tcp://1.2.3.4:11010",
+            PeerConnectionOrigin::UdpHolePunch,
+        );
+        assert!(tcp_punched.is_hole_punched());
+        assert_eq!(tcp_punched.remote_host_family(), ConnFamily::Ipv6);
+        assert!(udp_punched.is_hole_punched());
+        assert_eq!(udp_punched.remote_host_family(), ConnFamily::Ipv4);
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+        let tcp_id = tcp_punched.get_conn_id();
+        let udp_id = udp_punched.get_conn_id();
+        peer.conns.insert(tcp_id, Arc::new(tcp_punched));
+        peer.conns.insert(udp_id, Arc::new(udp_punched));
+
+        // 两种打洞来源都不算「直连」，但各自族的 has_conn_of_family 必须成立；
+        // 「已有另一族连接」不阻断偏好族判断的关键就是这里。
+        assert!(!peer.has_directly_connected_conn());
+        assert!(peer.has_conn_of_family(ConnFamily::Ipv6));
+        assert!(peer.has_conn_of_family(ConnFamily::Ipv4));
+        assert!(!peer.has_conn_of_family(ConnFamily::Unknown));
+
+        peer.conns.remove(&tcp_id);
+        peer.conns.remove(&udp_id);
+    }
+
+    #[tokio::test]
+    async fn has_conn_of_family_unknown_family_conn_matches_only_unknown() {
+        let context: ArcPeerContext = Arc::new(NoopPeerContext::default());
+        let domain = conn_with_remote_addr(
+            &context,
+            "tcp://example.com:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        let v6 = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::Direct,
+        );
+        assert_eq!(domain.remote_host_family(), ConnFamily::Unknown);
+        assert_eq!(v6.remote_host_family(), ConnFamily::Ipv6);
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context.clone());
+        let domain_id = domain.get_conn_id();
+        let v6_id = v6.get_conn_id();
+        peer.conns.insert(domain_id, Arc::new(domain));
+        peer.conns.insert(v6_id, Arc::new(v6));
+
+        // 未知族连接只满足 Unknown 查询；跨族负例：已有 Ipv6/Unknown 连接
+        // 时 Ipv4 查询仍为 false（不能把任何连接都算成「已有该族」）。
+        assert!(peer.has_conn_of_family(ConnFamily::Unknown));
+        assert!(peer.has_conn_of_family(ConnFamily::Ipv6));
+        assert!(!peer.has_conn_of_family(ConnFamily::Ipv4));
+
+        peer.conns.remove(&domain_id);
+        peer.conns.remove(&v6_id);
+    }
+
+    #[tokio::test]
+    async fn has_conn_of_family_ignores_closed_conn() {
+        // 用真实握手连接走 Peer 的关闭路径（close_peer_conn 由 close 事件
+        // 监听器摘除连接；摘除前连接可能还在 map 里，谓词必须不数它）。
+        let (client_tunnel, server_tunnel) = create_ring_tunnel_pair();
+        let client_ctx = Arc::new(NoopPeerContext::default());
+        let server_ctx = Arc::new(NoopPeerContext::default());
+        let session_store = Arc::new(PeerSessionStore::new());
+        let mut client_conn =
+            PeerConn::new(1, client_ctx.clone(), client_tunnel, session_store.clone());
+        let mut server_conn = PeerConn::new(2, server_ctx, server_tunnel, session_store);
+        let (client_ret, server_ret) = tokio::join!(
+            client_conn.do_handshake_as_client(),
+            server_conn.do_handshake_as_server_ext(|_, _| Ok(()))
+        );
+        client_ret.unwrap();
+        server_ret.unwrap();
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(3, packet_recv_chan, client_ctx);
+        let conn_id = client_conn.get_conn_id();
+        peer.conns.insert(conn_id, Arc::new(client_conn));
+
+        // ring 隧道没有 IP 地址 → 族 Unknown。
+        assert!(peer.has_conn_of_family(ConnFamily::Unknown));
+        assert!(!peer.has_conn_of_family(ConnFamily::Ipv4));
+
+        peer.close_peer_conn(&conn_id).await.unwrap();
+        // 关闭是异步生效的：等连接真正从 map 里摘掉后，查询必须回落 false。
+        use std::time::Duration;
+        use tokio::time::timeout;
+        timeout(Duration::from_secs(1), async {
+            while peer.has_conn_of_family(ConnFamily::Unknown) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("conn should be removed after close");
+        assert!(!peer.has_live_conns());
     }
 
     #[test]
