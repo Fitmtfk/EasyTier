@@ -14,6 +14,7 @@ use crate::{
     foundation::small_map_shard_amount,
     packet::ZCPacket,
     peers::{
+        PeerConnectionOrigin,
         context::{ArcPeerContext, NetworkIdentity, PeerEvent},
         error::Error,
         util::shrink_dashmap,
@@ -149,6 +150,17 @@ impl PeerMap {
     pub fn has_conn_of_family(&self, peer_id: PeerId, family: ConnFamily) -> bool {
         self.get_peer_by_id(peer_id)
             .map(|peer| peer.has_conn_of_family(family))
+            .unwrap_or(false)
+    }
+
+    /// peer 不在本地 map 时返回 false。
+    pub(crate) fn has_conn_with_origin(
+        &self,
+        peer_id: PeerId,
+        origin: PeerConnectionOrigin,
+    ) -> bool {
+        self.get_peer_by_id(peer_id)
+            .map(|peer| peer.has_conn_with_origin(origin))
             .unwrap_or(false)
     }
 

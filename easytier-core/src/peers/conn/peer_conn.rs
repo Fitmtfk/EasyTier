@@ -468,6 +468,10 @@ impl PeerConn {
         self.close_event_notifier.is_closed()
     }
 
+    pub(crate) fn origin(&self) -> PeerConnectionOrigin {
+        self.origin
+    }
+
     async fn wait_handshake(&self, need_retry: &mut bool) -> Result<HandshakeRequest, Error> {
         *need_retry = false;
 

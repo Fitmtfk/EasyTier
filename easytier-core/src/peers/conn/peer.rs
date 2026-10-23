@@ -12,7 +12,7 @@ use tracing::Instrument;
 use super::family::{ConnFamily, ConnFamilyPref, conn_counts_as_family};
 use super::peer_conn::{PeerConn, PeerConnId};
 use crate::peers::{
-    PacketRecvChan,
+    PacketRecvChan, PeerConnectionOrigin,
     context::{ArcPeerContext, PeerEvent},
     util::shrink_dashmap,
 };
@@ -369,6 +369,15 @@ impl Peer {
         })
     }
 
+    /// 是否存在未关闭、且来源为 origin 的连接。
+    /// 打洞层用它判断「本传输是否已为该 peer 产出过连接」。
+    pub(crate) fn has_conn_with_origin(&self, origin: PeerConnectionOrigin) -> bool {
+        self.conns.iter().any(|entry| {
+            let conn = entry.value();
+            !conn.is_closed() && conn.origin() == origin
+        })
+    }
+
     pub(crate) fn has_direct_attached_conn(&self) -> bool {
         self.conns.iter().any(|entry| {
             let conn = entry.value();
@@ -511,6 +520,39 @@ mod tests {
         // 未握手的连接没有 info，get_conn_info() 会 panic（上游既有行为），
         // 因此先摘掉连接再让 Peer 析构。
         peer.conns.remove(&conn_id);
+    }
+
+    #[tokio::test]
+    async fn has_conn_with_origin_distinguishes_origin() {
+        let context: ArcPeerContext = Arc::new(NoopPeerContext::default());
+        let punched = conn_with_remote_addr(
+            &context,
+            "tcp://1.2.3.4:11010",
+            PeerConnectionOrigin::UdpHolePunch,
+        );
+        let direct = conn_with_remote_addr(
+            &context,
+            "tcp://[2001:db8::1]:11010",
+            PeerConnectionOrigin::Direct,
+        );
+
+        let (packet_recv_chan, _recv_chan) = create_packet_recv_chan();
+        let peer = Peer::new(2, packet_recv_chan, context);
+        let punched_conn_id = punched.get_conn_id();
+        let direct_conn_id = direct.get_conn_id();
+        peer.conns.insert(punched_conn_id, Arc::new(punched));
+        peer.conns.insert(direct_conn_id, Arc::new(direct));
+
+        assert!(peer.has_conn_with_origin(PeerConnectionOrigin::UdpHolePunch));
+        assert!(peer.has_conn_with_origin(PeerConnectionOrigin::Direct));
+        // 别的打洞传输 / 其他来源不算。
+        assert!(!peer.has_conn_with_origin(PeerConnectionOrigin::TcpHolePunch));
+        assert!(!peer.has_conn_with_origin(PeerConnectionOrigin::Manual));
+
+        // 未握手的连接没有 info，get_conn_info() 会 panic（上游既有行为），
+        // 因此先摘掉连接再让 Peer 析构。
+        peer.conns.remove(&punched_conn_id);
+        peer.conns.remove(&direct_conn_id);
     }
 
     #[test]

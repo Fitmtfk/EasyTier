@@ -36,13 +36,18 @@ use super::{
 /// - `Auto`：保持上游语义（已有任意连接就不打洞）。
 /// - `prefer_ipv4` / `prefer_ipv6`：已有偏好族连接才不打洞。
 ///   例外：UDP 对称打洞只能产出 IPv4 路径，`prefer_ipv6` 下保持原样。
+///   连接属于哪一族不由本地决定（UDP 固定 V4，TCP 取决于对端映射地址），
+///   因此按**传输**收敛：本传输已产出过非偏好族连接 → 已尽力，不再重复打洞；
+///   别的传输（尤其 `prefer_ipv4` 下的 UDP）仍可继续打洞。
 ///
 /// 判定用闭包注入（不直接依赖 `PeerMap`），便于测试：
 /// - `has_conn`：该 peer 是否已有**偏好族**的连接（含打洞得到的连接）。
 /// - `has_any`：该 peer 是否已有**任意**连接（上游 `has_peer` 语义）。
+/// - `has_punched`：该 peer 是否已有**本传输**打洞来源的连接（未关闭）。
 pub(crate) fn has_satisfied_punch_condition(
     has_conn: impl Fn(PeerId) -> bool,
     has_any: impl Fn(PeerId) -> bool,
+    has_punched: impl Fn(PeerId) -> bool,
     peer_id: PeerId,
     prefer: ConnFamilyPref,
     udp_only_ipv4: bool,
@@ -50,8 +55,14 @@ pub(crate) fn has_satisfied_punch_condition(
     match prefer.preferred_family() {
         // UDP 对称打洞产不出 IPv6 路径，prefer_ipv6 下保持上游语义，
         // 否则会永远重复发起打洞。
-        Some(_) if !(udp_only_ipv4 && prefer == ConnFamilyPref::PreferIpv6) => has_conn(peer_id),
-        _ => has_any(peer_id),
+        Some(_) if !(udp_only_ipv4 && prefer == ConnFamilyPref::PreferIpv6) => {
+            if has_conn(peer_id) {
+                true // 偏好族已连通
+            } else {
+                has_punched(peer_id) // 本传输已尽力，不再重复打洞
+            }
+        }
+        _ => has_any(peer_id), // auto / prefer_ipv6+UDP：上游语义
     }
 }
 
@@ -75,6 +86,8 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
             None => false,
         };
         let has_any = |id: PeerId| peer_map.has_peer(id);
+        let has_punched =
+            |id: PeerId| peer_map.has_conn_with_origin(id, PeerConnectionOrigin::UdpHolePunch);
         self.list_route_snapshots()
             .await
             .into_iter()
@@ -94,6 +107,7 @@ impl UdpHolePunchPeerSource for PeerManagerCore {
                     has_direct_connection: has_satisfied_punch_condition(
                         &has_conn,
                         &has_any,
+                        &has_punched,
                         route.peer_id,
                         prefer,
                         true, // UDP 对称打洞只能产出 IPv4 路径
@@ -189,6 +203,8 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
             None => false,
         };
         let has_any = |id: PeerId| peer_map.has_peer(id);
+        let has_punched =
+            |id: PeerId| peer_map.has_conn_with_origin(id, PeerConnectionOrigin::TcpHolePunch);
         self.list_route_snapshots()
             .await
             .into_iter()
@@ -204,6 +220,7 @@ impl TcpHolePunchPeerSource for PeerManagerCore {
                 has_direct_connection: has_satisfied_punch_condition(
                     &has_conn,
                     &has_any,
+                    &has_punched,
                     route.peer_id,
                     prefer,
                     false, // TCP 对称打洞两族都支持
@@ -234,12 +251,15 @@ mod tests {
 
     const PEER: PeerId = 42;
 
-    /// 模拟一个 peer 的连接集合：peer_families 列出它已有的连接族。
-    /// 接线方式与生产代码一致：has_conn 按偏好族判定，has_any 判定「任意连接」。
+    /// 模拟一个 peer 的连接集合：peer_families 列出它已有的连接族，
+    /// punched 表示「本传输已为该 peer 产出过连接（未关闭）」。
+    /// 接线方式与生产代码一致：has_conn 按偏好族判定，has_any 判定「任意连接」，
+    /// has_punched 按本传输的打洞来源判定。
     fn punch_satisfied(
         prefer: ConnFamilyPref,
         udp_only_ipv4: bool,
         peer_families: &[ConnFamily],
+        punched: bool,
     ) -> bool {
         let preferred = prefer.preferred_family();
         has_satisfied_punch_condition(
@@ -248,6 +268,7 @@ mod tests {
                 None => false,
             },
             |_id| !peer_families.is_empty(),
+            |_id| punched,
             PEER,
             prefer,
             udp_only_ipv4,
@@ -257,17 +278,19 @@ mod tests {
     #[test]
     fn auto_keeps_upstream_skip_semantics() {
         // Auto：上游语义 —— 已有任意连接就不打洞，没有连接才打洞。
-        assert!(!punch_satisfied(ConnFamilyPref::Auto, true, &[]));
-        assert!(!punch_satisfied(ConnFamilyPref::Auto, false, &[]));
+        assert!(!punch_satisfied(ConnFamilyPref::Auto, true, &[], false));
+        assert!(!punch_satisfied(ConnFamilyPref::Auto, false, &[], false));
         assert!(punch_satisfied(
             ConnFamilyPref::Auto,
             true,
-            &[ConnFamily::Ipv6]
+            &[ConnFamily::Ipv6],
+            false
         ));
         assert!(punch_satisfied(
             ConnFamilyPref::Auto,
             false,
-            &[ConnFamily::Ipv4]
+            &[ConnFamily::Ipv4],
+            false
         ));
     }
 
@@ -277,12 +300,14 @@ mod tests {
         assert!(!punch_satisfied(
             ConnFamilyPref::PreferIpv4,
             true,
-            &[ConnFamily::Ipv6]
+            &[ConnFamily::Ipv6],
+            false
         ));
         assert!(!punch_satisfied(
             ConnFamilyPref::PreferIpv4,
             false,
-            &[ConnFamily::Ipv6]
+            &[ConnFamily::Ipv6],
+            false
         ));
     }
 
@@ -292,18 +317,21 @@ mod tests {
         assert!(punch_satisfied(
             ConnFamilyPref::PreferIpv4,
             true,
-            &[ConnFamily::Ipv4]
+            &[ConnFamily::Ipv4],
+            false
         ));
         assert!(punch_satisfied(
             ConnFamilyPref::PreferIpv4,
             false,
-            &[ConnFamily::Ipv4]
+            &[ConnFamily::Ipv4],
+            false
         ));
         // 两族并存时同样满足。
         assert!(punch_satisfied(
             ConnFamilyPref::PreferIpv4,
             true,
-            &[ConnFamily::Ipv4, ConnFamily::Ipv6]
+            &[ConnFamily::Ipv4, ConnFamily::Ipv6],
+            false
         ));
     }
 
@@ -313,12 +341,14 @@ mod tests {
         assert!(!punch_satisfied(
             ConnFamilyPref::PreferIpv6,
             false,
-            &[ConnFamily::Ipv4]
+            &[ConnFamily::Ipv4],
+            false
         ));
         assert!(punch_satisfied(
             ConnFamilyPref::PreferIpv6,
             false,
-            &[ConnFamily::Ipv6]
+            &[ConnFamily::Ipv6],
+            false
         ));
     }
 
@@ -329,9 +359,71 @@ mod tests {
         assert!(punch_satisfied(
             ConnFamilyPref::PreferIpv6,
             true,
-            &[ConnFamily::Ipv4]
+            &[ConnFamily::Ipv4],
+            false
         ));
-        assert!(!punch_satisfied(ConnFamilyPref::PreferIpv6, true, &[]));
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            true,
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv4_direct_ipv6_conn_does_not_block_punching() {
+        // 用户主场景：已有 Direct 来源的 IPv6 连接时，仍要打洞
+        // （Direct 来源不是打洞来源，TCP 与 UDP 都不受它阻塞）。
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            false,
+            &[ConnFamily::Ipv6],
+            false
+        ));
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            true,
+            &[ConnFamily::Ipv6],
+            false
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv4_tcp_transport_converges_after_non_preferred_conn() {
+        // TCP 对称打洞连的是对端映射地址，可能产出非偏好族连接：
+        // prefer_ipv4 下产出 IPv6 → TCP 该传输已尽力，不再重复打洞；
+        // 但 UDP 能产出 IPv4，必须继续打洞。
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            false,
+            &[ConnFamily::Ipv6],
+            true
+        ));
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv4,
+            true,
+            &[ConnFamily::Ipv6],
+            false
+        ));
+    }
+
+    #[test]
+    fn prefer_ipv6_tcp_transport_converges_after_non_preferred_conn() {
+        // prefer_ipv6 + TCP：对端映射地址是 IPv4 → 打洞产出 IPv4 连接。
+        // 该传输已尽力 → 不再重复打洞（否则连接数会持续增长）。
+        assert!(punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            false,
+            &[ConnFamily::Ipv4],
+            true
+        ));
+        // 本传输还没产出过连接 → 继续打洞。
+        assert!(!punch_satisfied(
+            ConnFamilyPref::PreferIpv6,
+            false,
+            &[ConnFamily::Ipv4],
+            false
+        ));
     }
 }
 
