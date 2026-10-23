@@ -60,6 +60,7 @@ use super::manual::{
     resolve_url_addrs,
 };
 
+mod family_budget;
 mod family_filter;
 mod udp;
 
@@ -242,6 +243,11 @@ where
     options: DirectConnectorOptions,
     listener_blacklist: ExpiringSet<ListenerBlacklistKey>,
     peer_blacklist: ExpiringSet<PeerId>,
+    /// 每个 peer 的偏好族直连重试预算（spec §4.6）。Mutex 不跨 await（R-e）。
+    family_budgets: std::sync::Mutex<family_budget::FamilyBudgetMap>,
+    /// 测试钩子：记录每次真正的直连拨号（peer, url, 本轮口径）。
+    #[cfg(test)]
+    dial_probe: Arc<std::sync::Mutex<Vec<(PeerId, Url, DirectSatisfaction)>>>,
 }
 
 impl<H> std::fmt::Debug for DirectConnectorData<H>
@@ -292,6 +298,9 @@ where
             options,
             listener_blacklist: ExpiringSet::default(),
             peer_blacklist: ExpiringSet::default(),
+            family_budgets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(test)]
+            dial_probe: Arc::new(std::sync::Mutex::new(Vec::new())),
         });
         let client = PeerTaskManager::new_with_external_signal(
             DirectConnectorLauncher(data.clone()),
@@ -415,6 +424,8 @@ where
                     && (static_allowed || dynamic_allowed)
                     && !data.peer_satisfied(route.peer_id)
                     && !data.peer_blacklist.contains(&route.peer_id)
+                    // R-b：预算过滤 —— 偏好模式下冷却中/已耗尽的 peer 不排任务。
+                    && data.family_attempt_allowed(route.peer_id)
             })
             .map(|route| route.peer_id)
             .collect()
@@ -447,6 +458,88 @@ where
         self.peer_satisfied_with(dst_peer_id, DirectSatisfaction::Preferred)
     }
 
+    /// 该 peer 当前连接数的同步观测（R-i `conn_snapshot` 的数据源）。
+    ///
+    /// 直接连接逐条计数；打洞连接按来源（TCP/UDP）存在性各计 1 —— 只用于
+    /// 「连接集合是否变化」的比较，不必精确到每一条连接。
+    fn family_peer_conn_total(&self, dst_peer_id: PeerId) -> usize {
+        let Some(peer) = self.peer_manager.get_peer_map().get_peer_by_id(dst_peer_id) else {
+            return 0;
+        };
+        let mut total = peer.get_directly_connections().len();
+        for origin in [
+            PeerConnectionOrigin::TcpHolePunch,
+            PeerConnectionOrigin::UdpHolePunch,
+        ] {
+            if peer.has_conn_with_origin(origin) {
+                total += 1;
+            }
+        }
+        total
+    }
+
+    /// 预算判定（R-b 两个接入点共用）：非偏好模式恒放行；偏好模式下正在
+    /// 冷却或已耗尽 → 不放行（冷却在放行判定中自然到期并开新窗口）。
+    fn family_attempt_allowed(&self, dst_peer_id: PeerId) -> bool {
+        let prefer = self.peer_manager.direct_conn_family();
+        if prefer == ConnFamilyPref::Auto {
+            return true;
+        }
+        let conn_total = self.family_peer_conn_total(dst_peer_id);
+        let mut budgets = self.family_budgets.lock().unwrap();
+        family_budget::family_attempt_allowed(
+            &mut budgets,
+            dst_peer_id,
+            prefer,
+            crate::foundation::time::Instant::now(),
+            conn_total,
+        )
+    }
+
+    /// 记一次轮失败（R-d）：一轮打满仍未满足偏好族时调用；
+    /// 冷却 / 耗尽在记账点就地 warn（R-g）。
+    fn family_round_failure(&self, dst_peer_id: PeerId) {
+        let prefer = self.peer_manager.direct_conn_family();
+        if prefer == ConnFamilyPref::Auto {
+            return;
+        }
+        let conn_total = self.family_peer_conn_total(dst_peer_id);
+        let mut budgets = self.family_budgets.lock().unwrap();
+        family_budget::family_round_failure(
+            &mut budgets,
+            dst_peer_id,
+            prefer,
+            crate::foundation::time::Instant::now(),
+            conn_total,
+        );
+        if let Some(state) = budgets.get(&dst_peer_id) {
+            if state.exhausted {
+                tracing::warn!(
+                    ?dst_peer_id,
+                    exhausted_conn_snapshot = ?state.conn_snapshot,
+                    "preferred-family direct connect budget exhausted; paused until \
+                     preference or the peer's connection set changes"
+                );
+            } else if state.cooldown_until.is_some() {
+                tracing::warn!(
+                    ?dst_peer_id,
+                    cooldown = ?family_budget::FAMILY_CONNECT_WINDOW_COOLDOWN,
+                    "preferred-family direct connect window exhausted; cooling down"
+                );
+            }
+        }
+    }
+
+    /// 记一次成功（R-h 的唯一成功口径：偏好族已满足）。清零该 peer 的预算。
+    fn family_attempt_succeeded(&self, dst_peer_id: PeerId) {
+        let prefer = self.peer_manager.direct_conn_family();
+        if prefer == ConnFamilyPref::Auto {
+            return;
+        }
+        let mut budgets = self.family_budgets.lock().unwrap();
+        family_budget::family_attempt_succeeded(&mut budgets, dst_peer_id, prefer);
+    }
+
     /// 直连需求是否已被满足（按本轮的口径判定）。
     ///
     /// - `DirectSatisfaction::Preferred`：与现有 `peer_satisfied` 语义一致 ——
@@ -477,6 +570,16 @@ where
         loop {
             if self.peer_blacklist.contains(&dst_peer_id) {
                 anyhow::bail!("peer {dst_peer_id} is blacklisted");
+            }
+            if !self.family_attempt_allowed(dst_peer_id) {
+                // 预算耗尽或冷却中：安静退出本次任务，等下一次 collect 重新判定
+                // （R-b：冷却/耗尽后不再发起直连）。
+                tracing::warn!(
+                    ?dst_peer_id,
+                    "preferred-family direct connect budget unavailable; \
+                     abort this round of direct connect attempts"
+                );
+                return Ok(());
             }
             if attempt > 0 {
                 crate::foundation::time::sleep(Duration::from_millis(backoffs_ms[backoff_index]))
@@ -513,8 +616,12 @@ where
                 .await;
             tracing::info!(?result, dst_peer_id, "direct-connect attempt returned");
             if self.peer_satisfied(dst_peer_id) {
+                // R-h：只有偏好族已满足才记成功并清零预算（第 4.6 节成功口径）。
+                self.family_attempt_succeeded(dst_peer_id);
                 return Ok(());
             }
+            // R-d：一轮（一次外层退避循环迭代）跑到仍未满足偏好族 → 记一次轮失败。
+            self.family_round_failure(dst_peer_id);
         }
     }
 
@@ -804,6 +911,11 @@ where
             return Ok(());
         }
         let url = Url::parse(raw_url)?;
+        #[cfg(test)]
+        self.dial_probe
+            .lock()
+            .unwrap()
+            .push((dst_peer_id, url.clone(), satisfaction));
         let (peer_id, conn_id) = if url.scheme() == "udp" {
             match url.host() {
                 Some(Host::Ipv6(_)) => self.connect_public_ipv6(dst_peer_id, &url).await?,
@@ -1557,6 +1669,298 @@ mod tests {
         assert_eq!(
             plan.other.listeners[0].as_str(),
             "tcp://[2001:db8::1]:11010"
+        );
+    }
+
+    // ---- T4 正向路径集成用例：预算与兜底轮在同一套拨号链路上共存 ----
+
+    use crate::config::peers::{HostRoutingPolicy, PeerRuntimeConfig};
+    use crate::config::{CoreConfig, NetworkIdentity};
+    use crate::connectivity::hole_punch::udp::{
+        UdpHolePunchRuntime, UdpPunchListener, UdpPunchSocket, UdpResolvedPublicAddr,
+    };
+    use crate::host::testkit::{TestDns, TestHost, TestUdpSocket};
+    use crate::peers::peer_manager::PortablePeerManagerConfig;
+    use crate::proto::common::{StunInfo, Url as ProtoUrl};
+    use crate::socket::tcp::{TcpConnectOptions, VirtualTcpSocketFactory};
+    use crate::socket::udp::UdpBindOptions;
+
+    struct TestStun;
+
+    #[async_trait::async_trait]
+    impl StunInfoProvider for TestStun {
+        fn get_stun_info(&self) -> StunInfo {
+            StunInfo::default()
+        }
+
+        async fn get_udp_port_mapping(&self, _local_port: u16) -> anyhow::Result<SocketAddr> {
+            anyhow::bail!("budget test does not map udp ports")
+        }
+
+        async fn get_tcp_port_mapping(&self, _local_port: u16) -> anyhow::Result<SocketAddr> {
+            anyhow::bail!("budget test does not map tcp ports")
+        }
+
+        fn update_stun_info(&self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl StunSocketMapper<TestUdpSocket> for TestStun {
+        async fn get_udp_port_mapping_with_socket(
+            &self,
+            _socket: Arc<TestUdpSocket>,
+        ) -> anyhow::Result<SocketAddr> {
+            anyhow::bail!("budget test does not map udp ports")
+        }
+    }
+
+    struct TestUpgrader;
+
+    #[async_trait::async_trait]
+    impl
+        crate::connectivity::protocol::ClientProtocolUpgrader<
+            <TestHost as crate::socket::tcp::VirtualTcpSocketFactory>::Socket,
+        > for TestUpgrader
+    {
+        fn supports_scheme(&self, _scheme: &str) -> bool {
+            false
+        }
+
+        async fn upgrade_client(
+            &self,
+            _connected: crate::connectivity::transport::ConnectedTransport<
+                <TestHost as crate::socket::tcp::VirtualTcpSocketFactory>::Socket,
+            >,
+            _requested_url: Url,
+        ) -> anyhow::Result<Box<dyn crate::tunnel::Tunnel>> {
+            anyhow::bail!("budget test never upgrades (all dials fail)")
+        }
+    }
+
+    struct TestDirectHost(Arc<TestHost>);
+
+    #[async_trait::async_trait]
+    impl VirtualTcpSocketFactory for TestDirectHost {
+        type Socket = <TestHost as VirtualTcpSocketFactory>::Socket;
+
+        async fn connect_tcp(&self, options: TcpConnectOptions) -> anyhow::Result<Self::Socket> {
+            self.0.connect_tcp(options).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UdpHolePunchRuntime for TestDirectHost {
+        type Socket = TestUdpSocket;
+
+        async fn bind_udp(&self, _options: UdpBindOptions) -> anyhow::Result<Arc<TestUdpSocket>> {
+            anyhow::bail!("budget test does not punch udp")
+        }
+
+        async fn resolve_udp_public_addr(
+            &self,
+            _socket: Arc<TestUdpSocket>,
+        ) -> anyhow::Result<UdpResolvedPublicAddr> {
+            anyhow::bail!("budget test does not punch udp")
+        }
+
+        async fn create_listener(
+            &self,
+            _prefer_port_mapping: bool,
+        ) -> anyhow::Result<UdpPunchListener<TestUdpSocket>> {
+            anyhow::bail!("budget test does not punch udp")
+        }
+
+        async fn create_port_bound_listener(
+            &self,
+            _port: u16,
+        ) -> anyhow::Result<UdpPunchListener<TestUdpSocket>> {
+            anyhow::bail!("budget test does not punch udp")
+        }
+
+        async fn connect_with_socket(
+            &self,
+            _socket: Arc<TestUdpSocket>,
+            _remote: SocketAddr,
+        ) -> anyhow::Result<UdpPunchSocket> {
+            anyhow::bail!("budget test does not punch udp")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManualConnectorHost for TestDirectHost {
+        async fn local_addr_for_remote(
+            &self,
+            remote_addr: SocketAddr,
+            _context: SocketContext,
+        ) -> anyhow::Result<SocketAddr> {
+            Ok(match remote_addr {
+                SocketAddr::V4(_) => "127.0.0.1:0".parse().unwrap(),
+                SocketAddr::V6(_) => "[::1]:0".parse().unwrap(),
+            })
+        }
+
+        async fn interface_addrs(
+            &self,
+        ) -> anyhow::Result<crate::connectivity::manual::ManualInterfaceAddrs> {
+            Ok(crate::connectivity::manual::ManualInterfaceAddrs {
+                interface_ipv4s: vec![],
+                interface_ipv6s: vec![],
+                public_ipv6: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DirectConnectorHost for TestDirectHost {
+        async fn collect_ip_addrs(&self, _context: &SocketContext) -> GetIpListResponse {
+            GetIpListResponse::default()
+        }
+
+        fn mapped_listeners(&self) -> Vec<Url> {
+            Vec::new()
+        }
+
+        fn is_local_ip(&self, _ip: &IpAddr) -> bool {
+            false
+        }
+
+        async fn preferred_ipv6_source(
+            &self,
+            _ip: Ipv6Addr,
+            _context: SocketContext,
+        ) -> Option<PreferredIpv6Source> {
+            None
+        }
+    }
+
+    fn prefer_ipv4_peer_manager() -> Arc<PeerManagerCore> {
+        let runtime = PeerRuntimeConfig {
+            core: CoreConfig::default(),
+            network_identity: NetworkIdentity::default(),
+            stun_info: StunInfo::default(),
+            feature_flags: Default::default(),
+            secure_mode: None,
+            host_routing: HostRoutingPolicy::default(),
+        };
+        let mut peer_config = PortablePeerManagerConfig::new(runtime);
+        peer_config.snapshot.flags.direct_conn_family = "prefer_ipv4".to_owned();
+        let (packet_sender, packet_receiver) = crate::host::packet::host_packet_channel();
+        std::mem::forget(packet_receiver);
+        Arc::new(
+            PeerManagerCore::new_portable_for_test(peer_config, packet_sender)
+                .expect("build portable peer manager"),
+        )
+    }
+
+    /// 一轮直连 = 一次外层退避循环迭代（R-c）：
+    /// 拿 IP 列表跑 `try_direct_connect_with_ip_list`，跑到仍未满足偏好族就记
+    /// 一次轮失败 —— 与 `try_direct_connect` 中的两个调用点逐一对应。
+    async fn run_one_budget_round(
+        data: &Arc<DirectConnectorData<TestDirectHost>>,
+        dst_peer_id: PeerId,
+        ip_list: GetIpListResponse,
+    ) {
+        let _ = data
+            .try_direct_connect_with_ip_list(dst_peer_id, ip_list)
+            .await;
+        if !data.peer_satisfied(dst_peer_id) {
+            data.family_round_failure(dst_peer_id);
+        }
+    }
+
+    fn listeners_ip_list(listeners: &[&str]) -> GetIpListResponse {
+        GetIpListResponse {
+            listeners: listeners
+                .iter()
+                .map(|s| ProtoUrl::from(Url::parse(s).unwrap()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefer_family_budget_gate_and_any_family_fallback_share_the_dial_path() {
+        let peer_manager = prefer_ipv4_peer_manager();
+        assert_eq!(
+            peer_manager.direct_conn_family(),
+            ConnFamilyPref::PreferIpv4
+        );
+
+        let data: Arc<DirectConnectorData<TestDirectHost>> = Arc::new(DirectConnectorData {
+            peer_manager: peer_manager.clone(),
+            host: Arc::new(TestDirectHost(Arc::new(TestHost::default()))),
+            protected_tcp_ports: Arc::new(ProtectedTcpPortRegistry::default()),
+            stun: Arc::new(TestStun),
+            running_listeners: Arc::new(NoLocalListeners),
+            dns: Arc::new(TestDns),
+            protocol: Arc::new(TestUpgrader),
+            options: DirectConnectorOptions {
+                testing: true,
+                ..Default::default()
+            },
+            listener_blacklist: ExpiringSet::default(),
+            peer_blacklist: ExpiringSet::default(),
+            family_budgets: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dial_probe: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+
+        let dst_peer_id: PeerId = 7;
+        // 该 peer 当前没有任何族的连接（兜底门的一部分条件）。
+        assert!(!data.peer_satisfied_with(dst_peer_id, DirectSatisfaction::AnyFamily));
+
+        // 一轮：偏好族（IPv4）listener 拨号失败 → 兜底门打开 → 另一族（IPv6）
+        // listener 真正进入拨号级（不是停在 plan 函数上）。
+        let ip_list = listeners_ip_list(&["tcp://127.0.0.1:9911", "tcp://[::1]:9911"]);
+        run_one_budget_round(&data, dst_peer_id, ip_list).await;
+
+        let probes = data.dial_probe.lock().unwrap().clone();
+        assert!(
+            probes.iter().any(|(peer, url, sat)| *peer == dst_peer_id
+                && url.as_str() == "tcp://127.0.0.1:9911"
+                && *sat == DirectSatisfaction::Preferred),
+            "pass 1 (preferred family) must reach dial level: {probes:?}"
+        );
+        assert!(
+            probes.iter().any(|(peer, url, sat)| *peer == dst_peer_id
+                && url.as_str() == "tcp://[::1]:9911"
+                && *sat == DirectSatisfaction::AnyFamily),
+            "fallback pass must reach dial level with AnyFamily satisfaction: {probes:?}"
+        );
+
+        // 预算推进与兜底轮共存：连续 3 轮失败后窗口关闭（第 4 轮被预算放行判定拒绝）。
+        for _ in 0..2 {
+            run_one_budget_round(
+                &data,
+                dst_peer_id,
+                listeners_ip_list(&["tcp://127.0.0.1:9911", "tcp://[::1]:9911"]),
+            )
+            .await;
+        }
+        assert!(!data.family_attempt_allowed(dst_peer_id));
+        {
+            let budgets = data.family_budgets.lock().unwrap();
+            let state = budgets.get(&dst_peer_id).expect("budget recorded");
+            assert_eq!(state.windows, 1);
+            assert!(state.cooldown_until.is_some());
+            assert!(!state.exhausted);
+        }
+        // 兜底拨号每一轮都真实发生（3 轮；每轮对该 URL 的内层重试会多次下探，
+        // paused 时钟下 1000+2000+4000ms 即时推进 → 每轮每族 ≥4 次拨号，这里只断言
+        // 每族 ≥3 次，即每轮至少一次真实拨号，不把内层重试次数焊死在断言里）。
+        let probes = data.dial_probe.lock().unwrap().clone();
+        assert!(
+            probes
+                .iter()
+                .filter(|(_, _, sat)| *sat == DirectSatisfaction::AnyFamily)
+                .count()
+                >= 3
+        );
+        assert!(
+            probes
+                .iter()
+                .filter(|(_, _, sat)| *sat == DirectSatisfaction::Preferred)
+                .count()
+                >= 3
         );
     }
 }
