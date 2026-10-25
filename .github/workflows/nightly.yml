@@ -1,9 +1,8 @@
 name: EasyTier Nightly
 
 on:
-  schedule:
-    # 03:17 Asia/Shanghai; avoid the busy start of the hour.
-    - cron: '17 19 * * *'
+  # Nightly builds are upstream-only. This fork runs them on demand instead of
+  # on a schedule, so the `schedule` trigger is intentionally removed.
   workflow_dispatch:
 
 concurrency:
